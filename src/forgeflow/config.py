@@ -42,6 +42,7 @@ class AppConfig(BaseModel):
     weights: dict[str, float] = Field(default_factory=lambda: dict(DEFAULT_WEIGHTS))
     skill_keywords: dict[str, list[str]] = Field(default_factory=dict)
     exclude_labels: list[str] = Field(default_factory=list)
+    opt_out_labels: list[str] = Field(default_factory=list)
     preferred_labels: list[str] = Field(default_factory=list)
 
     @field_validator("repositories")

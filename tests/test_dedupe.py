@@ -182,3 +182,47 @@ def test_every_drop_has_a_non_empty_reason_and_detail() -> None:
     for dropped in result.dropped:
         assert dropped.reason
         assert dropped.detail
+
+
+# --- opt-out labels (SPEC section 2B) ---------------------------------------
+
+
+def test_filter_drops_opted_out_issue_with_reason() -> None:
+    """A repository opting out of automated contributions is excluded."""
+    result = filter_issues(
+        [make_issue(1, labels=["no-bot"])],
+        exclude_labels=EXCLUDE,
+        opt_out_labels=["no-bot", "do-not-contribute"],
+    )
+    assert result.kept == []
+    assert result.dropped[0].reason is DropReason.OPT_OUT
+    assert "opts out" in result.dropped[0].detail
+
+
+def test_opt_out_takes_precedence_over_excluded_label() -> None:
+    issue = make_issue(1, labels=["no-bot", "duplicate"])
+    result = filter_issues([issue], exclude_labels=EXCLUDE, opt_out_labels=["no-bot"])
+    assert result.dropped[0].reason is DropReason.OPT_OUT
+
+
+def test_opt_out_matching_is_case_insensitive() -> None:
+    result = filter_issues(
+        [make_issue(1, labels=["No-Bot"])],
+        exclude_labels=EXCLUDE,
+        opt_out_labels=["no-bot"],
+    )
+    assert result.dropped[0].reason is DropReason.OPT_OUT
+
+
+def test_no_opt_out_labels_configured_keeps_issue() -> None:
+    result = filter_issues([make_issue(1, labels=["no-bot"])], exclude_labels=EXCLUDE)
+    assert len(result.kept) == 1
+
+
+def test_opt_out_reason_appears_in_drop_counts() -> None:
+    result = filter_issues(
+        [make_issue(1, labels=["no-bot"]), make_issue(2, labels=["no-bot"])],
+        exclude_labels=EXCLUDE,
+        opt_out_labels=["no-bot"],
+    )
+    assert result.drop_reasons() == {"opt_out": 2}

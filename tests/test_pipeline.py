@@ -38,6 +38,7 @@ def build_config() -> AppConfig:
         weights=dict(DEFAULT_WEIGHTS),
         skill_keywords={"python": ["python", "typing"]},
         exclude_labels=["duplicate", "wontfix", "invalid"],
+        opt_out_labels=["no-bot", "do-not-contribute"],
     )
 
 
@@ -61,6 +62,7 @@ def build_client(fake_client):
         issue_payload(102, labels=[{"name": "wontfix"}]),  # excluded label
         issue_payload(103, state="closed"),  # excluded closed
         issue_payload(104, assignees=[{"login": "dev"}]),  # excluded assigned
+        issue_payload(105, labels=[{"name": "no-bot"}]),  # repo opted out
         issue_payload(101),  # duplicate of 101
     ]
     fake_client.issues[REPO2] = [
@@ -88,7 +90,7 @@ def test_full_pipeline_end_to_end(fake_client, db_path, tmp_path) -> None:
         conn.close()
 
     assert stored == 2, "one eligible issue per repository"
-    assert excluded == 4, "duplicate, wontfix, closed, and assigned are all recorded"
+    assert excluded == 5, "duplicate, wontfix, closed, assigned, and opt-out are all recorded"
 
     # 2. rank
     ranked = run_rank(db_path, config)
@@ -107,7 +109,7 @@ def test_full_pipeline_end_to_end(fake_client, db_path, tmp_path) -> None:
     assert f"{REPO}#101" in text
     assert f"{REPO2}#201" in text
     assert "heuristics" in text and "not proven predictors" in text
-    for reason in ("closed", "assigned", "excluded_label", "duplicate"):
+    for reason in ("closed", "assigned", "excluded_label", "duplicate", "opt_out"):
         assert reason in text, f"report must record the '{reason}' exclusion"
 
     # 4. shortlist

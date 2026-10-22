@@ -66,6 +66,15 @@ exclude_labels:
   - discussion
   - epic
 
+# Labels meaning the repository has opted out of automated contributions.
+# These are checked before exclude_labels and are reported as 'opt_out'
+# (SPEC section 2B: "repositories whose contribution rules opt out").
+opt_out_labels:
+  - no-bot
+  - do-not-contribute
+  - no-automation
+  - bot-not-welcome
+
 # Labels that suggest an issue is a good starting point. Used as a positive
 # signal in scope and clarity scoring.
 preferred_labels:

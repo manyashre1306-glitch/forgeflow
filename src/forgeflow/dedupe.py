@@ -30,6 +30,7 @@ class DropReason(StrEnum):
     ASSIGNED = "assigned"
     LINKED_OPEN_PR = "linked_open_pr"
     EXCLUDED_LABEL = "excluded_label"
+    OPT_OUT = "opt_out"
 
 
 @dataclass(frozen=True)
@@ -106,13 +107,17 @@ def filter_issues(
     issues: Iterable[Issue],
     *,
     exclude_labels: Iterable[str] = (),
+    opt_out_labels: Iterable[str] = (),
 ) -> FilterResult:
     """Apply the eligibility rules, recording a reason for every drop.
 
     An issue may match several rules; the first match in the order below wins, so
-    the reported reason is deterministic.
+    the reported reason is deterministic. ``opt_out_labels`` are checked before
+    ``exclude_labels`` because a repository opting out of automated contributions
+    is the stronger signal.
     """
     excluded = list(exclude_labels)
+    opt_out = list(opt_out_labels)
     result = FilterResult()
     for issue in issues:
         if issue.is_pull_request:
@@ -141,6 +146,16 @@ def filter_issues(
                     issue,
                     DropReason.LINKED_OPEN_PR,
                     f"linked to open pull request(s): {numbers}",
+                )
+            )
+            continue
+        opted_out = _excluded_label(issue, opt_out)
+        if opted_out is not None:
+            result.dropped.append(
+                DroppedIssue(
+                    issue,
+                    DropReason.OPT_OUT,
+                    f"repository opts out of automated contributions (label '{opted_out}')",
                 )
             )
             continue

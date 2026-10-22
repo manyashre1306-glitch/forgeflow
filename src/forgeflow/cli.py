@@ -135,7 +135,11 @@ def run_discover(
                 )
             unique = enriched
 
-        filtered = filter_issues(unique, exclude_labels=config.exclude_labels)
+        filtered = filter_issues(
+            unique,
+            exclude_labels=config.exclude_labels,
+            opt_out_labels=config.opt_out_labels,
+        )
 
         for issue in filtered.kept:
             storage.upsert_issue(conn, issue)
