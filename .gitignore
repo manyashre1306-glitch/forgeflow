@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+
+# Tooling caches
+.ruff_cache/
+.pytest_cache/
+
+# Secrets and local environment
+.env
+
+# Local data: database and generated reports
+data/*.db
+data/reports/
+
+# OS / editor noise
+.DS_Store

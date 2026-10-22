@@ -1,0 +1,74 @@
+# ForgeFlow Phase 1 configuration.
+# Edit this file to change the repository allowlist, ranking weights, or skills.
+# No secrets belong in this file.
+
+# Repositories ForgeFlow may discover issues from. Nothing outside this list is
+# ever queried, and Phase 1 never writes to any repository.
+repositories:
+  - scikit-learn/scikit-learn
+  - pydantic/pydantic
+  - pandas-dev/pandas
+  - huggingface/transformers
+  - psf/requests
+  - encode/httpx
+
+# Ranking weights. These must sum to 1.0; startup validation enforces that.
+# SPEC section 5: treat these as initial heuristics, not proven predictors of
+# PR acceptance.
+weights:
+  skill_relevance: 0.25
+  issue_clarity: 0.20
+  feasible_scope: 0.20
+  testability: 0.15
+  repository_health: 0.10
+  duplicate_conflict_risk: 0.10
+
+# Keywords used to judge skill relevance (SPEC section 5). Matched
+# case-insensitively against issue titles, bodies, and labels.
+skill_keywords:
+  python:
+    - python
+    - py313
+    - typing
+    - mypy
+    - ruff
+  ai_ml:
+    - machine learning
+    - deep learning
+    - neural
+    - transformer
+    - model
+    - inference
+    - training
+    - pytorch
+    - tensorflow
+    - scikit-learn
+  data_science:
+    - dataframe
+    - numpy
+    - pandas
+    - statistics
+    - visualization
+  devtools:
+    - cli
+    - lint
+    - formatter
+    - packaging
+    - ci
+    - pytest
+
+# Labels that make an issue ineligible in Phase 1 (SPEC section 2B).
+exclude_labels:
+  - duplicate
+  - invalid
+  - wontfix
+  - "status: wontfix"
+  - discussion
+  - epic
+
+# Labels that suggest an issue is a good starting point. Used as a positive
+# signal in scope and clarity scoring.
+preferred_labels:
+  - good first issue
+  - help wanted
+  - bug
