@@ -63,14 +63,17 @@ class FakeGitHubClient:
         issues: dict[str, list[dict]] | None = None,
         files: dict[str, set[str]] | None = None,
         timelines: dict[tuple[str, int], list[dict]] | None = None,
+        directories: dict[str, list[str]] | None = None,
     ) -> None:
         self.repositories = repositories or {}
         self.issues = issues or {}
         self.files = files or {}
         self.timelines = timelines or {}
+        self.directories = directories or {}
         self.search_calls: list[tuple[str, int]] = []
         self.repo_calls: list[str] = []
         self.file_calls: list[tuple[str, str]] = []
+        self.directory_calls: list[tuple[str, str]] = []
         self.timeline_calls: list[tuple[str, int]] = []
         self.raise_on_repo: set[str] = set()
         self.raise_on_search: set[str] = set()
@@ -96,6 +99,14 @@ class FakeGitHubClient:
     def has_file(self, full_name: str, path: str, *, ref: str | None = None) -> bool:
         self.file_calls.append((full_name, path))
         return path in self.files.get(full_name, set())
+
+    def list_directory(self, full_name: str, path: str = "") -> list[str]:
+        """Return configured directory entries, or [] when unset.
+
+        Paths are recorded so tests can assert on request counts.
+        """
+        self.directory_calls.append((full_name, path))
+        return list(self.directories.get(f"{full_name}:{path}", []))
 
     def get_issue_timeline(self, full_name: str, number: int) -> list[dict]:
         self.timeline_calls.append((full_name, number))

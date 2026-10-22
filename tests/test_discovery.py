@@ -207,3 +207,170 @@ def test_collect_linked_open_prs_handles_broken_timeline(fake_client) -> None:
 
     fake_client.get_issue_timeline = boom
     assert collect_linked_open_prs(fake_client, issue) == []
+
+
+# --- expanded path detection (repository_health inputs) ---------------------
+
+
+def _repo(fake_client, full_name: str = REPO) -> None:
+    fake_client.repositories[full_name] = {"full_name": full_name}
+
+
+def test_detects_root_contributing_md(fake_client) -> None:
+    _repo(fake_client)
+    fake_client.files[REPO] = {"CONTRIBUTING.md"}
+    assert fetch_repository(fake_client, REPO).has_contributing is True
+
+
+def test_detects_github_dir_contributing(fake_client) -> None:
+    _repo(fake_client)
+    fake_client.files[REPO] = {".github/CONTRIBUTING.md"}
+    assert fetch_repository(fake_client, REPO).has_contributing is True
+
+
+def test_detects_pandas_contributing_rst(fake_client) -> None:
+    """pandas keeps its guide at doc/source/development/contributing.rst."""
+    _repo(fake_client)
+    fake_client.files[REPO] = {"doc/source/development/contributing.rst"}
+    assert fetch_repository(fake_client, REPO).has_contributing is True
+
+
+def test_detects_scikit_learn_contributing_rst(fake_client) -> None:
+    _repo(fake_client)
+    fake_client.files[REPO] = {"doc/developers/contributing.rst"}
+    assert fetch_repository(fake_client, REPO).has_contributing is True
+
+
+def test_detects_docs_contributing_via_glob(fake_client) -> None:
+    """docs/contributing* must match via a directory listing."""
+    _repo(fake_client)
+    fake_client.directories[f"{REPO}:docs"] = ["contributing.md", "api"]
+    assert fetch_repository(fake_client, REPO).has_contributing is True
+
+
+def test_detects_doc_contributing_via_glob(fake_client) -> None:
+    _repo(fake_client)
+    fake_client.directories[f"{REPO}:doc"] = ["contributing.rst", "conf.py"]
+    assert fetch_repository(fake_client, REPO).has_contributing is True
+
+
+def test_detects_root_tests_dir(fake_client) -> None:
+    _repo(fake_client)
+    fake_client.files[REPO] = {"tests"}
+    assert fetch_repository(fake_client, REPO).has_tests is True
+
+
+def test_detects_root_test_dir(fake_client) -> None:
+    _repo(fake_client)
+    fake_client.files[REPO] = {"test"}
+    assert fetch_repository(fake_client, REPO).has_tests is True
+
+
+def test_detects_tox_ini(fake_client) -> None:
+    _repo(fake_client)
+    fake_client.files[REPO] = {"tox.ini"}
+    assert fetch_repository(fake_client, REPO).has_tests is True
+
+
+def test_detects_pandas_package_tests(fake_client) -> None:
+    """pandas keeps tests at pandas/tests, not a root tests/ directory."""
+    _repo(fake_client)
+    fake_client.files[REPO] = {"pandas/tests"}
+    assert fetch_repository(fake_client, REPO).has_tests is True
+
+
+def test_detects_sklearn_package_tests(fake_client) -> None:
+    """scikit-learn keeps tests at sklearn/tests."""
+    _repo(fake_client)
+    fake_client.files[REPO] = {"sklearn/tests"}
+    assert fetch_repository(fake_client, REPO).has_tests is True
+
+
+def test_detects_src_layout_tests_via_glob(fake_client) -> None:
+    """src/*/tests must match through a directory listing of src/."""
+    _repo(fake_client)
+    fake_client.directories[f"{REPO}:src"] = ["mypkg", "other"]
+    fake_client.files[REPO] = {"src/mypkg/tests"}
+    assert fetch_repository(fake_client, REPO).has_tests is True
+
+
+def test_detects_package_tests_via_glob(fake_client) -> None:
+    """*/tests matches a package-directory layout for any top-level name."""
+    _repo(fake_client)
+    fake_client.directories[f"{REPO}:"] = ["somepkg", "docs"]
+    fake_client.files[REPO] = {"somepkg/tests"}
+    assert fetch_repository(fake_client, REPO).has_tests is True
+
+
+def test_detects_pytest_ini(fake_client) -> None:
+    _repo(fake_client)
+    fake_client.files[REPO] = {"pytest.ini"}
+    assert fetch_repository(fake_client, REPO).has_tests is True
+
+
+def test_detects_noxfile(fake_client) -> None:
+    _repo(fake_client)
+    fake_client.files[REPO] = {"noxfile.py"}
+    assert fetch_repository(fake_client, REPO).has_tests is True
+
+
+def test_reports_absence_when_no_paths_match(fake_client) -> None:
+    _repo(fake_client)
+    repo = fetch_repository(fake_client, REPO)
+    assert repo.has_contributing is False
+    assert repo.has_tests is False
+
+
+def test_glob_does_not_match_unrelated_entries(fake_client) -> None:
+    _repo(fake_client)
+    fake_client.directories[f"{REPO}:docs"] = ["api.md", "usage.md"]
+    fake_client.directories[f"{REPO}:"] = ["src", "docs"]
+    repo = fetch_repository(fake_client, REPO)
+    assert repo.has_contributing is False
+    assert repo.has_tests is False
+
+
+def test_detect_tests_can_be_disabled(fake_client) -> None:
+    _repo(fake_client)
+    fake_client.files[REPO] = {"tests"}
+    repo = fetch_repository(fake_client, REPO, detect_tests=False)
+    assert repo.has_tests is False
+
+
+def test_contributing_check_stops_at_first_hit(fake_client) -> None:
+    """The first matching pattern wins, so requests stay bounded."""
+    _repo(fake_client)
+    fake_client.files[REPO] = {"CONTRIBUTING.md"}
+    fetch_repository(fake_client, REPO)
+    assert fake_client.file_calls[0] == (REPO, "CONTRIBUTING.md")
+
+
+def test_wildcard_matches_are_capped(fake_client) -> None:
+    """A huge directory listing must not cause unbounded matching."""
+    from forgeflow.discovery import MAX_WILDCARD_MATCHES
+
+    _repo(fake_client)
+    fake_client.directories[f"{REPO}:"] = [f"pkg{i}" for i in range(500)]
+    fake_client.files[REPO] = set()  # no matches at all
+    repo = fetch_repository(fake_client, REPO)
+    assert repo.has_tests is False
+    # Only the capped prefix is ever consulted.
+    assert len(fake_client.file_calls) < 500 + MAX_WILDCARD_MATCHES + 20
+
+
+def test_path_exists_literal_uses_has_file(fake_client) -> None:
+    from forgeflow.discovery import path_exists
+
+    _repo(fake_client)
+    fake_client.files[REPO] = {"tests"}
+    assert path_exists(fake_client, REPO, "tests") is True
+    assert path_exists(fake_client, REPO, "missing") is False
+
+
+def test_any_path_exists_short_circuits(fake_client) -> None:
+    from forgeflow.discovery import any_path_exists
+
+    _repo(fake_client)
+    fake_client.files[REPO] = {"tests"}
+    assert any_path_exists(fake_client, REPO, ("missing", "tests")) is True
+    assert fake_client.file_calls == [(REPO, "missing"), (REPO, "tests")]

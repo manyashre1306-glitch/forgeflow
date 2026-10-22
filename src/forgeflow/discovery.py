@@ -12,6 +12,7 @@ The GitHub client is injected, so tests supply a fake and no network is touched.
 
 from __future__ import annotations
 
+import fnmatch
 from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -21,16 +22,49 @@ from forgeflow.config import AppConfig
 from forgeflow.github_client import GitHubReader
 from forgeflow.models import Issue, Repository
 
-# Files that indicate contribution guidance exists.
+# Files that indicate contribution guidance exists. Entries may contain a "*"
+# wildcard in one segment, matched against the directory listing. The list covers
+# the conventional root and .github locations plus the documentation-directory
+# layouts used by larger projects (for example pandas keeps its guide at
+# doc/source/development/contributing.rst, which a root-only check misses).
 CONTRIBUTING_PATHS: tuple[str, ...] = (
     "CONTRIBUTING.md",
     "CONTRIBUTING.rst",
     "CONTRIBUTING.txt",
+    "CONTRIBUTING",
     ".github/CONTRIBUTING.md",
+    ".github/CONTRIBUTING.rst",
+    "docs/CONTRIBUTING.md",
+    "docs/CONTRIBUTING.rst",
+    "doc/CONTRIBUTING.md",
+    "doc/CONTRIBUTING.rst",
+    "docs/contributing*",
+    "doc/contributing*",
+    "docs/source/development/contributing*",
+    "docs/development/contributing*",
+    "doc/source/development/contributing.rst",
+    "doc/developers/contributing.rst",
 )
 
-# Paths that indicate a test suite exists.
-TEST_PATHS: tuple[str, ...] = ("tests", "test", "tox.ini")
+# Paths that indicate a test suite exists. "tests" and "test" cover the common
+# root layout; "src/*/tests" covers the src layout; "*/tests" covers the
+# package-directory layout used by pandas (pandas/tests) and scikit-learn
+# (sklearn/tests), where a root-only check would report no test suite.
+TEST_PATHS: tuple[str, ...] = (
+    "tests",
+    "test",
+    "tox.ini",
+    "pytest.ini",
+    "noxfile.py",
+    "src/*/tests",
+    "*/tests",
+    "pandas/tests",
+    "sklearn/tests",
+)
+
+# Safety cap on how many directory entries a single wildcard is matched against,
+# so one very large repository cannot cause an unbounded number of requests.
+MAX_WILDCARD_MATCHES = 50
 
 
 def parse_github_datetime(value: Any) -> datetime | None:
@@ -109,6 +143,55 @@ class DiscoveryResult:
     errors: list[str] = field(default_factory=list)
 
 
+def _glob_match(
+    client: GitHubReader,
+    full_name: str,
+    segments: list[str],
+    base: str = "",
+) -> bool:
+    """Match one path pattern segment by segment against the repository tree.
+
+    A literal segment is checked with ``has_file``; a segment containing ``*`` is
+    matched against the directory listing with ``fnmatch``. Matching stops at the
+    first hit, so the common case costs a single directory listing.
+    """
+    if not segments:
+        return client.has_file(full_name, base) if base else True
+
+    first, rest = segments[0], segments[1:]
+
+    if "*" not in first:
+        candidate = f"{base}/{first}".strip("/")
+        if not rest:
+            return client.has_file(full_name, candidate)
+        return _glob_match(client, full_name, rest, candidate)
+
+    entries = client.list_directory(full_name, base)[:MAX_WILDCARD_MATCHES]
+    for name in entries:
+        if not fnmatch.fnmatch(name, first):
+            continue
+        candidate = f"{base}/{name}".strip("/")
+        if not rest or _glob_match(client, full_name, rest, candidate):
+            return True
+    return False
+
+
+def path_exists(client: GitHubReader, full_name: str, pattern: str) -> bool:
+    """Return True if ``pattern`` exists in the repository.
+
+    Literal paths are checked directly. Patterns containing ``*`` are matched
+    against directory listings.
+    """
+    if "*" not in pattern:
+        return client.has_file(full_name, pattern)
+    return _glob_match(client, full_name, pattern.split("/"))
+
+
+def any_path_exists(client: GitHubReader, full_name: str, patterns: tuple[str, ...]) -> bool:
+    """Return True as soon as any pattern matches. Stops early on the first hit."""
+    return any(path_exists(client, full_name, pattern) for pattern in patterns)
+
+
 def fetch_repository(
     client: GitHubReader,
     full_name: str,
@@ -119,10 +202,10 @@ def fetch_repository(
     payload = client.get_repository(full_name)
     repo = repository_from_api(payload)
 
-    has_contributing = any(client.has_file(full_name, path) for path in CONTRIBUTING_PATHS)
+    has_contributing = any_path_exists(client, full_name, CONTRIBUTING_PATHS)
     has_tests = False
     if detect_tests:
-        has_tests = any(client.has_file(full_name, path) for path in TEST_PATHS)
+        has_tests = any_path_exists(client, full_name, TEST_PATHS)
 
     return repo.model_copy(update={"has_contributing": has_contributing, "has_tests": has_tests})
 

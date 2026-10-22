@@ -85,6 +85,8 @@ class GitHubReader(Protocol):
 
     def has_file(self, full_name: str, path: str, *, ref: str | None = ...) -> bool: ...
 
+    def list_directory(self, full_name: str, path: str = ...) -> list[str]: ...
+
     def get_issue_timeline(self, full_name: str, number: int) -> list[dict[str, Any]]: ...
 
 
@@ -298,6 +300,29 @@ class GitHubClient:
                 return False
             raise
         return True
+
+    def list_directory(self, full_name: str, path: str = "") -> list[str]:
+        """List entry names in a repository directory.
+
+        Returns an empty list when the path does not exist, so callers can treat
+        "missing" and "empty" the same way. Read-only.
+        """
+        url = f"{self._base_url}/repos/{full_name}/contents"
+        if path:
+            url = f"{url}/{path}"
+        try:
+            payload = self._get_json(url)
+        except GitHubError as exc:
+            if "not found" in str(exc):
+                return []
+            raise
+        if not isinstance(payload, list):
+            return []
+        names: list[str] = []
+        for entry in payload:
+            if isinstance(entry, dict) and "name" in entry:
+                names.append(str(entry["name"]))
+        return names
 
     def get_issue_timeline(self, full_name: str, number: int) -> list[dict[str, Any]]:
         """Fetch an issue's timeline, used to detect linked pull requests."""
