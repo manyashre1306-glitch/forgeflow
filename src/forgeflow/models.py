@@ -321,3 +321,89 @@ class RepoContext(BaseModel):
     total_bytes: int = 0
     truncated: bool = False
     cloned_at: datetime | None = None
+
+
+# --------------------------------------------------------------------------
+# Phase 2: LLM analysis and cost tracking
+# --------------------------------------------------------------------------
+
+
+class TriageResult(BaseModel):
+    """Validated output of the cheap triage call."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    actionable: bool
+    problem_summary: str = ""
+    clarity: float = Field(default=0.0, ge=0.0, le=1.0)
+    scope_hint: str = "unclear"
+    missing_information: list[str] = Field(default_factory=list)
+    injection_flagged: bool = False
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
+class AnalysisResult(BaseModel):
+    """Validated output of the strong analysis call (SPEC section 2E).
+
+    Every field the spec requires is present and non-optional, so a model that
+    omits the test plan or the risks fails validation instead of silently
+    producing a half-filled report.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    problem_explanation: str = Field(min_length=1)
+    minimal_fix_proposal: str = Field(min_length=1)
+    risks: list[str] = Field(default_factory=list)
+    test_plan: list[str] = Field(default_factory=list)
+    files_likely_involved: list[str] = Field(default_factory=list)
+    unverified_assumptions: list[str] = Field(default_factory=list)
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    triage: TriageResult | None = None
+
+
+class ModelPricing(BaseModel):
+    """Per-million-token prices for one model, in US dollars.
+
+    Held in configuration rather than hard-coded, because prices change and a
+    wrong constant would silently corrupt every cost figure.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    input_per_million: float = Field(ge=0.0)
+    output_per_million: float = Field(ge=0.0)
+
+
+class LLMUsage(BaseModel):
+    """One recorded model call, for cost tracking and auditing."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: int | None = None
+    created_at: datetime | None = None
+    repo_full_name: str
+    issue_number: int
+    purpose: str
+    model: str
+    prompt_tokens: int = Field(default=0, ge=0)
+    completion_tokens: int = Field(default=0, ge=0)
+    cost_usd: float = Field(default=0.0, ge=0.0)
+    success: bool = True
+    error: str | None = None
+
+    @property
+    def total_tokens(self) -> int:
+        return self.prompt_tokens + self.completion_tokens
+
+
+def compute_cost_usd(
+    prompt_tokens: int,
+    completion_tokens: int,
+    pricing: ModelPricing,
+) -> float:
+    """Return the cost of one call, rounded to six decimal places."""
+    cost = (
+        prompt_tokens * pricing.input_per_million + completion_tokens * pricing.output_per_million
+    ) / 1_000_000
+    return round(cost, 6)

@@ -19,6 +19,7 @@ from pathlib import Path
 from forgeflow.models import (
     Issue,
     IssueScore,
+    LLMUsage,
     Repository,
     TaskState,
     validate_transition,
@@ -86,6 +87,20 @@ CREATE TABLE IF NOT EXISTS excluded_issues (
     detail         TEXT NOT NULL DEFAULT '',
     recorded_at    TEXT NOT NULL,
     PRIMARY KEY (repo_full_name, number, reason)
+);
+
+CREATE TABLE IF NOT EXISTS llm_usage (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at        TEXT NOT NULL,
+    repo_full_name    TEXT NOT NULL,
+    issue_number      INTEGER NOT NULL,
+    purpose           TEXT NOT NULL,
+    model             TEXT NOT NULL,
+    prompt_tokens     INTEGER NOT NULL DEFAULT 0,
+    completion_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_usd          REAL NOT NULL DEFAULT 0.0,
+    success           INTEGER NOT NULL DEFAULT 1,
+    error             TEXT
 );
 
 CREATE TABLE IF NOT EXISTS status_changes (
@@ -477,3 +492,91 @@ def list_repositories(conn: sqlite3.Connection) -> list[Repository]:
         )
         for row in rows
     ]
+
+
+# --------------------------------------------------------------------------
+# Phase 2: LLM cost tracking
+# --------------------------------------------------------------------------
+
+
+def record_llm_usage(conn: sqlite3.Connection, usage: LLMUsage) -> int:
+    """Insert one model call and return its row id."""
+    cursor = conn.execute(
+        """
+        INSERT INTO llm_usage (
+            created_at, repo_full_name, issue_number, purpose, model,
+            prompt_tokens, completion_tokens, cost_usd, success, error
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            usage.created_at.isoformat() if usage.created_at else utcnow(),
+            usage.repo_full_name,
+            usage.issue_number,
+            usage.purpose,
+            usage.model,
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.cost_usd,
+            1 if usage.success else 0,
+            usage.error,
+        ),
+    )
+    conn.commit()
+    return int(cursor.lastrowid or 0)
+
+
+def _row_to_usage(row: sqlite3.Row) -> LLMUsage:
+    created = row["created_at"]
+    return LLMUsage(
+        id=row["id"],
+        created_at=datetime.fromisoformat(created) if created else None,
+        repo_full_name=row["repo_full_name"],
+        issue_number=row["issue_number"],
+        purpose=row["purpose"],
+        model=row["model"],
+        prompt_tokens=row["prompt_tokens"],
+        completion_tokens=row["completion_tokens"],
+        cost_usd=row["cost_usd"],
+        success=bool(row["success"]),
+        error=row["error"],
+    )
+
+
+def list_llm_usage(conn: sqlite3.Connection) -> list[LLMUsage]:
+    """Return every recorded model call, oldest first."""
+    rows = conn.execute("SELECT * FROM llm_usage ORDER BY id").fetchall()
+    return [_row_to_usage(row) for row in rows]
+
+
+def spent_since(conn: sqlite3.Connection, since: datetime) -> float:
+    """Total recorded cost at or after ``since``.
+
+    Failed calls are counted: a request that errored may still have consumed
+    tokens, and under-reporting spend is the unsafe direction for a spending cap.
+    """
+    row = conn.execute(
+        "SELECT COALESCE(SUM(cost_usd), 0.0) AS total FROM llm_usage WHERE created_at >= ?",
+        (since.isoformat(),),
+    ).fetchone()
+    return float(row["total"])
+
+
+def spent_in_month(conn: sqlite3.Connection, *, now: datetime | None = None) -> float:
+    """Total recorded cost in the current calendar month, UTC."""
+    moment = now or datetime.now(UTC)
+    start = moment.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return spent_since(conn, start)
+
+
+def total_tokens_in_month(conn: sqlite3.Connection, *, now: datetime | None = None) -> int:
+    """Total prompt plus completion tokens recorded this calendar month."""
+    moment = now or datetime.now(UTC)
+    start = moment.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    row = conn.execute(
+        """
+        SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0) AS total
+        FROM llm_usage WHERE created_at >= ?
+        """,
+        (start.isoformat(),),
+    ).fetchone()
+    return int(row["total"])

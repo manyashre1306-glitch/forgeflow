@@ -26,11 +26,42 @@ from pydantic import (
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from forgeflow.models import DEFAULT_WEIGHTS, SCORE_FACTORS
+from forgeflow.models import DEFAULT_WEIGHTS, SCORE_FACTORS, ModelPricing
 
 
 class ConfigError(ValueError):
     """Raised when the configuration file is missing or invalid."""
+
+
+class LLMConfig(BaseModel):
+    """Model selection, pricing, and spending limits.
+
+    Prices live in configuration because vendor pricing changes; a hard-coded
+    constant would quietly make every cost figure wrong.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    triage_model: str = "gemini-2.5-flash"
+    analysis_model: str = "gemini-2.5-pro"
+    pricing: dict[str, ModelPricing] = Field(default_factory=dict)
+    monthly_cap_usd: float = Field(default=5.0, ge=0.0)
+    max_retries: int = Field(default=2, ge=0, le=5)
+    timeout_seconds: float = Field(default=60.0, gt=0.0)
+    max_output_tokens: int = Field(default=4096, gt=0)
+
+    def pricing_for(self, model: str) -> ModelPricing:
+        """Return the configured price for a model.
+
+        An unconfigured model costs 0.0 here but is flagged by
+        :meth:`unknown_models`, so the operator can see the gap rather than
+        silently believing spend is tracked.
+        """
+        return self.pricing.get(model, ModelPricing(input_per_million=0.0, output_per_million=0.0))
+
+    def unknown_models(self) -> list[str]:
+        """Models in use that have no configured price."""
+        return [m for m in (self.triage_model, self.analysis_model) if m not in self.pricing]
 
 
 class AppConfig(BaseModel):
@@ -44,6 +75,7 @@ class AppConfig(BaseModel):
     exclude_labels: list[str] = Field(default_factory=list)
     opt_out_labels: list[str] = Field(default_factory=list)
     preferred_labels: list[str] = Field(default_factory=list)
+    llm: LLMConfig = Field(default_factory=lambda: LLMConfig())
 
     @field_validator("repositories")
     @classmethod
@@ -94,6 +126,8 @@ class Settings(BaseSettings):
     )
 
     github_token: SecretStr | None = Field(default=None)
+    llm_api_key: SecretStr | None = Field(default=None)
+    llm_provider: str = Field(default="gemini")
 
 
 def load_config(path: str | Path) -> AppConfig:
