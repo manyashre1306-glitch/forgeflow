@@ -451,3 +451,131 @@ class AnalysisRecord(BaseModel):
     model: str
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     payload_json: str
+
+
+class CheckKind(StrEnum):
+    """The kinds of quality check SPEC section 7 requires."""
+
+    TESTS = "tests"
+    LINT = "lint"
+    FORMAT = "format"
+    TYPES = "types"
+    DIFF = "diff"
+
+
+class CheckStatus(StrEnum):
+    """Outcome of one check. PASSED requires execution evidence."""
+
+    PASSED = "passed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+    ERRORED = "errored"
+
+
+class ValidationCheck(BaseModel):
+    """One recorded check: command, status, output, and why it was skipped.
+
+    ``command`` is stored as a list so it survives shell quoting and can be
+    re-run verbatim. ``status`` is only ever PASSED when the command actually
+    ran and exited zero; a check that could not run is SKIPPED with a reason,
+    never PASSED.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: CheckKind
+    name: str
+    command: list[str] = Field(default_factory=list)
+    status: CheckStatus
+    exit_code: int | None = None
+    output: str = ""
+    duration_seconds: float = 0.0
+    skip_reason: str | None = None
+    limitation: str | None = None
+    timed_out: bool = False
+
+    @property
+    def passed(self) -> bool:
+        return self.status is CheckStatus.PASSED
+
+    @property
+    def blocking(self) -> bool:
+        """A failed or errored check blocks publishing; a skip does not."""
+        return self.status in {CheckStatus.FAILED, CheckStatus.ERRORED}
+
+
+class DiffFinding(BaseModel):
+    """One suspicious thing found while inspecting a diff."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    category: str
+    severity: str = "warning"
+    path: str = ""
+    detail: str
+    evidence: str = ""
+
+
+class ValidationReport(BaseModel):
+    """The full result of validating one patch (SPEC section 7)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    repo_full_name: str
+    issue_number: int
+    patch_sha256: str
+    isolated: bool
+    checks: list[ValidationCheck] = Field(default_factory=list)
+    findings: list[DiffFinding] = Field(default_factory=list)
+    repair_attempts: int = 0
+    environment_limitations: list[str] = Field(default_factory=list)
+    exception_authorized_by: str | None = None
+    exception_reason: str | None = None
+    created_at: datetime | None = None
+
+    @property
+    def blocking_failures(self) -> list[ValidationCheck]:
+        return [check for check in self.checks if check.blocking]
+
+    @property
+    def skipped(self) -> list[ValidationCheck]:
+        return [check for check in self.checks if check.status is CheckStatus.SKIPPED]
+
+    @property
+    def applicable(self) -> list[ValidationCheck]:
+        """Checks that had a command to run.
+
+        A check with no command means the repository does not use that tool, so
+        it is not evidence either way. A check that was skipped *despite* having
+        a command (no isolation, or a refused destructive command) is a real
+        gap and stays in this list.
+        """
+        return [check for check in self.checks if check.command]
+
+    @property
+    def passed(self) -> bool:
+        """True only when every applicable check ran and exited zero.
+
+        A pass requires execution evidence: at least one applicable check, all
+        of them PASSED, and no blocking diff finding. An all-skipped report is
+        never a pass, which is what stops "no isolation" from being read as
+        success.
+        """
+        applicable = self.applicable
+        if not applicable:
+            return False
+        if any(check.status is not CheckStatus.PASSED for check in applicable):
+            return False
+        return not any(finding.severity == "blocking" for finding in self.findings)
+
+    @property
+    def may_publish(self) -> bool:
+        """Whether this report permits publishing.
+
+        A documented exception is the only way past a failure (SPEC section 7).
+        Without one, publishing requires the same evidence a pass requires, so a
+        report with no executed checks can never authorize a publish.
+        """
+        if self.exception_authorized_by:
+            return True
+        return self.passed
