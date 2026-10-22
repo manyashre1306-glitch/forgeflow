@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 import httpx
@@ -74,7 +74,6 @@ class ClientStats:
     rate_limit_waits: int = 0
     last_rate_limit: RateLimit | None = None
     pages_fetched: int = 0
-    endpoints: list[str] = field(default_factory=list)
 
 
 class GitHubReader(Protocol):

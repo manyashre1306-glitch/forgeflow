@@ -77,6 +77,17 @@ CREATE TABLE IF NOT EXISTS runs (
     notes          TEXT NOT NULL DEFAULT ''
 );
 
+CREATE TABLE IF NOT EXISTS excluded_issues (
+    repo_full_name TEXT NOT NULL,
+    number         INTEGER NOT NULL,
+    title          TEXT NOT NULL DEFAULT '',
+    url            TEXT NOT NULL DEFAULT '',
+    reason         TEXT NOT NULL,
+    detail         TEXT NOT NULL DEFAULT '',
+    recorded_at    TEXT NOT NULL,
+    PRIMARY KEY (repo_full_name, number, reason)
+);
+
 CREATE TABLE IF NOT EXISTS status_changes (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     repo_full_name TEXT NOT NULL,
@@ -369,3 +380,100 @@ def finish_run(
         (utcnow(), status, issues_seen, notes, run_id),
     )
     conn.commit()
+
+
+def upsert_excluded_issue(
+    conn: sqlite3.Connection,
+    *,
+    repo_full_name: str,
+    number: int,
+    reason: str,
+    detail: str = "",
+    title: str = "",
+    url: str = "",
+) -> None:
+    """Record an excluded issue. Idempotent on (repo, number, reason)."""
+    conn.execute(
+        """
+        INSERT INTO excluded_issues (
+            repo_full_name, number, title, url, reason, detail, recorded_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(repo_full_name, number, reason) DO UPDATE SET
+            title = excluded.title,
+            url = excluded.url,
+            detail = excluded.detail,
+            recorded_at = excluded.recorded_at
+        """,
+        (repo_full_name, number, title, url, reason, detail, utcnow()),
+    )
+    conn.commit()
+
+
+def list_excluded_issues(conn: sqlite3.Connection) -> list[dict[str, str]]:
+    """Return every recorded exclusion, ordered by repository then number."""
+    rows = conn.execute(
+        """
+        SELECT repo_full_name, number, title, url, reason, detail
+        FROM excluded_issues
+        ORDER BY repo_full_name, number, reason
+        """
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def count_excluded_issues(conn: sqlite3.Connection) -> int:
+    """Return the number of recorded exclusions."""
+    return int(conn.execute("SELECT COUNT(*) FROM excluded_issues").fetchone()[0])
+
+
+def _row_to_score(row: sqlite3.Row) -> IssueScore:
+    try:
+        reasons = json.loads(row["reasons"]) if row["reasons"] else {}
+    except (TypeError, ValueError):
+        reasons = {}
+    return IssueScore(
+        repo_full_name=row["repo_full_name"],
+        issue_number=row["issue_number"],
+        skill_relevance=row["skill_relevance"],
+        issue_clarity=row["issue_clarity"],
+        feasible_scope=row["feasible_scope"],
+        testability=row["testability"],
+        repository_health=row["repository_health"],
+        duplicate_conflict_risk=row["duplicate_conflict_risk"],
+        reasons=reasons,
+    )
+
+
+def get_issue_score(
+    conn: sqlite3.Connection, repo_full_name: str, issue_number: int
+) -> IssueScore | None:
+    """Return a stored score, or None."""
+    row = conn.execute(
+        "SELECT * FROM issue_scores WHERE repo_full_name = ? AND issue_number = ?",
+        (repo_full_name, issue_number),
+    ).fetchone()
+    return None if row is None else _row_to_score(row)
+
+
+def list_issue_scores(conn: sqlite3.Connection) -> list[IssueScore]:
+    """Return every stored score, ordered by repository then issue number."""
+    rows = conn.execute(
+        "SELECT * FROM issue_scores ORDER BY repo_full_name, issue_number"
+    ).fetchall()
+    return [_row_to_score(row) for row in rows]
+
+
+def list_repositories(conn: sqlite3.Connection) -> list[Repository]:
+    """Return every stored repository."""
+    rows = conn.execute("SELECT * FROM repositories ORDER BY full_name").fetchall()
+    return [
+        Repository(
+            full_name=row["full_name"],
+            stars=row["stars"],
+            open_issues=row["open_issues"],
+            has_contributing=bool(row["has_contributing"]),
+            has_tests=bool(row["has_tests"]),
+            last_pushed_at=row["last_pushed_at"],
+        )
+        for row in rows
+    ]
