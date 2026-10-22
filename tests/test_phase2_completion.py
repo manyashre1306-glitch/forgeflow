@@ -177,8 +177,13 @@ def test_require_kill_switch_clear_is_a_noop_when_off() -> None:
 
 
 def test_kill_switch_error_names_the_remedy() -> None:
+    """The remedy names the source that is actually engaged.
+
+    Phase 3 made the message source-aware, so a config-file stop now points at
+    the config file rather than at an environment variable that is not set.
+    """
     config = AppConfig(repositories=["a/b"], kill_switch=True)
-    with pytest.raises(KillSwitchEngagedError, match="Unset FORGEFLOW_KILL_SWITCH"):
+    with pytest.raises(KillSwitchEngagedError, match="kill_switch: false"):
         require_kill_switch_clear(config)
 
 

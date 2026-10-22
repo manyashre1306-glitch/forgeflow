@@ -154,17 +154,32 @@ class KillSwitchEngagedError(RuntimeError):
 def kill_switch_engaged(
     config: AppConfig | None = None,
     settings: Settings | None = None,
+    conn: object | None = None,
 ) -> tuple[bool, str]:
     """Report whether the kill switch is engaged, and why.
 
-    Two independent sources, so either one alone is enough to stop the system:
-    ``kill_switch: true`` in ``config/repositories.yaml``, or
-    ``FORGEFLOW_KILL_SWITCH`` set to a truthy value in the environment. The
-    environment route matters because it can be set on a running deployment
-    without editing a file that might be under review.
+    Three independent sources, so any one alone is enough to stop the system:
+
+    * ``kill_switch: true`` in ``config/repositories.yaml``
+    * ``FORGEFLOW_KILL_SWITCH`` set in the environment
+    * the ``kill_switch`` row in SQLite, set by ``forgeflow kill-switch on``
+
+    The database route exists because it can be flipped while the system is
+    running and without touching a file that might be under review. The
+    environment route works when the database is unreachable. Any engaged source
+    stops the run; the first one found is reported.
     """
     if config is not None and config.kill_switch:
         return True, "kill_switch is enabled in the configuration file"
+
+    if conn is not None:
+        from forgeflow import killswitch
+
+        state = killswitch.read_state(conn)  # type: ignore[arg-type]
+        if state.engaged:
+            who = f" by {state.changed_by}" if state.changed_by else ""
+            why = f": {state.reason}" if state.reason else ""
+            return True, f"kill switch engaged in the database{who}{why}"
 
     resolved = settings if settings is not None else Settings()
     if resolved.kill_switch:
@@ -176,15 +191,29 @@ def kill_switch_engaged(
 def require_kill_switch_clear(
     config: AppConfig | None = None,
     settings: Settings | None = None,
+    conn: object | None = None,
 ) -> None:
     """Raise if the kill switch is engaged. No-op otherwise."""
-    engaged, reason = kill_switch_engaged(config, settings)
+    engaged, reason = kill_switch_engaged(config, settings, conn)
     if engaged:
         raise KillSwitchEngagedError(
-            f"kill switch engaged ({reason}); refusing to continue. Unset "
-            f"{KILL_SWITCH_ENV} or set kill_switch: false in the configuration "
-            f"file to resume."
+            f"kill switch engaged ({reason}); refusing to continue. {_remedy_for(reason)}"
         )
+
+
+def _remedy_for(reason: str) -> str:
+    """Name the one action that clears the source that is actually engaged.
+
+    A generic remedy is worse than none: telling an operator to unset an
+    environment variable that is not set sends them down the wrong path.
+    """
+    if "configuration file" in reason:
+        return "Set kill_switch: false in the configuration file to resume."
+    if "database" in reason:
+        return "Run 'forgeflow kill-switch off' to resume."
+    if KILL_SWITCH_ENV in reason:
+        return f"Unset {KILL_SWITCH_ENV} to resume."
+    return "Clear the engaged kill-switch source to resume."
 
 
 def load_config(path: str | Path) -> AppConfig:

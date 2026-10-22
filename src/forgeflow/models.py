@@ -579,3 +579,39 @@ class ValidationReport(BaseModel):
         if self.exception_authorized_by:
             return True
         return self.passed
+
+
+class AuditEvent(BaseModel):
+    """One append-only audit record (SPEC section 9).
+
+    ``detail`` and ``payload_json`` are already redacted when this object is
+    built, so nothing downstream can reintroduce a secret by printing it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: int | None = None
+    created_at: datetime | None = None
+    event: str
+    repo_full_name: str | None = None
+    issue_number: int | None = None
+    actor: str = "forgeflow"
+    severity: str = "info"
+    detail: str = ""
+    payload_json: str = "{}"
+
+
+class KillSwitchState(BaseModel):
+    """The persistent kill-switch flag, stored in SQLite (SPEC section 9).
+
+    Three sources can engage the switch: this database flag, the configuration
+    file, and the environment. Any one of them is sufficient, so an operator can
+    stop the system through whichever channel is reachable at the time.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    engaged: bool = False
+    reason: str = ""
+    changed_by: str = ""
+    changed_at: datetime | None = None

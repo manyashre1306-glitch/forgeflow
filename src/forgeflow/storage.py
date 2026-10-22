@@ -170,6 +170,11 @@ def init_db(conn: sqlite3.Connection) -> None:
     """Create the schema. Safe to call repeatedly."""
     conn.executescript(SCHEMA)
     conn.commit()
+    # Phase 3 tables live in their own modules so each owns its schema.
+    from forgeflow import audit, killswitch
+
+    audit.ensure_schema(conn)
+    killswitch.ensure_schema(conn)
 
 
 def upsert_repository(conn: sqlite3.Connection, repo: Repository) -> None:

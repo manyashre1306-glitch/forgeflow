@@ -18,8 +18,8 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from forgeflow import audit, killswitch, storage
 from forgeflow import report as report_module
-from forgeflow import storage
 from forgeflow.agent_runner import AgentUnavailableError, get_agent
 from forgeflow.config import (
     AppConfig,
@@ -468,8 +468,11 @@ def analyze(
     repo_full_name, number = parse_issue_reference(issue)
     try:
         config = load_app_config(config_path)
-        require_kill_switch_clear(config)
         conn = open_db(db_path)
+        # Check all three sources: the config file, the environment, and the
+        # database flag. Checking only the config would let a database stop be
+        # bypassed by this command.
+        require_kill_switch_clear(config, None, conn)
     except KillSwitchEngagedError as exc:
         console.print(f"[red]kill switch:[/red] {exc}")
         raise typer.Exit(code=1) from exc
@@ -519,6 +522,7 @@ def analyze(
 def implement(
     issue: Annotated[str, typer.Argument(help="Issue reference, e.g. pydantic/pydantic#1234.")],
     db_path: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
+    config_path: Annotated[Path, typer.Option("--config")] = DEFAULT_CONFIG_PATH,
     workspace_root: Annotated[Path, typer.Option("--workspace-root")] = Path("data/workspaces"),
     provider: Annotated[
         str, typer.Option("--provider", help="Coding agent provider: mock or jules.")
@@ -542,18 +546,17 @@ def implement(
         raise typer.Exit(code=1)
 
     try:
+        config = load_app_config(config_path)
         conn = open_db(db_path)
+        require_kill_switch_clear(config, None, conn)
+    except KillSwitchEngagedError as exc:
+        console.print(f"[red]kill switch:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
     except ForgeFlowError as exc:
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
-    try:
-        require_kill_switch_clear()
-    except KillSwitchEngagedError as exc:
-        console.print(f"[red]kill switch:[/red] {exc}")
-        raise typer.Exit(code=1) from exc
-
-    sandbox = build_sandbox()
+    sandbox = build_sandbox(app_config=config)
     if not sandbox.is_isolated:
         console.print("[yellow]warning:[/yellow] no container isolation available.")
         console.print(
@@ -690,6 +693,125 @@ def workspace(
 
     console.print(f"[red]error:[/red] unknown action {action!r}; use list, prune, or remove")
     raise typer.Exit(code=1)
+
+
+@app.command("kill-switch")
+def kill_switch(
+    action: Annotated[str, typer.Argument(help="One of: status, on, off.")] = "status",
+    db_path: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
+    reason: Annotated[str, typer.Option("--reason", help="Why the switch was flipped.")] = "",
+    actor: Annotated[str, typer.Option("--actor", help="Who flipped it.")] = "operator",
+) -> None:
+    """Engage, disengage, or inspect the persistent kill switch.
+
+    Engaging stops all model calls and sandbox execution. This is the database
+    flag; the configuration file and FORGEFLOW_KILL_SWITCH do the same thing.
+    Any one of the three is enough to stop a run.
+    """
+    if action not in {"status", "on", "off"}:
+        console.print(f"[red]error:[/red] unknown action {action!r}; use status, on, or off")
+        raise typer.Exit(code=1)
+
+    conn = open_db(db_path)
+    try:
+        if action == "status":
+            state = killswitch.read_state(conn)
+            table = Table(title="kill switch")
+            table.add_column("field")
+            table.add_column("value")
+            table.add_row("engaged", "yes" if state.engaged else "no")
+            table.add_row("reason", state.reason or "-")
+            table.add_row("changed by", state.changed_by or "-")
+            table.add_row("changed at", state.changed_at.isoformat() if state.changed_at else "-")
+            console.print(table)
+
+            # Report the other two sources too, so the operator sees the whole
+            # picture rather than only the database flag.
+            from forgeflow.config import kill_switch_engaged
+
+            engaged, why = kill_switch_engaged(None, None, conn)
+            console.print(
+                f"effective: {'ENGAGED' if engaged else 'clear'} ({why or 'no source engaged'})"
+            )
+            return
+
+        engaged = action == "on"
+        state = killswitch.set_state(conn, engaged, reason=reason, actor=actor)
+        audit.record(
+            conn,
+            "kill_switch.engaged" if engaged else "kill_switch.disengaged",
+            actor=actor,
+            severity="critical" if engaged else "info",
+            detail=reason or f"kill switch turned {action}",
+        )
+        console.print(f"kill switch {'ENGAGED' if state.engaged else 'DISENGAGED'}")
+        if state.engaged:
+            console.print("All model calls and sandbox execution will now be refused.")
+    finally:
+        conn.close()
+
+
+@app.command()
+def audit_log(
+    db_path: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
+    issue: Annotated[
+        str | None, typer.Option("--issue", help="Filter to one issue reference.")
+    ] = None,
+    event: Annotated[str | None, typer.Option("--event", help="Filter to one event name.")] = None,
+    limit: Annotated[int, typer.Option("--limit")] = 20,
+    verify: Annotated[
+        bool, typer.Option("--verify", help="Prove the append-only triggers are active.")
+    ] = False,
+) -> None:
+    """Show the append-only audit log, newest first."""
+    conn = open_db(db_path)
+    try:
+        if verify:
+            ok, why = audit.verify_append_only(conn)
+            if ok:
+                console.print("append-only: verified (UPDATE and DELETE both refused)")
+            else:
+                console.print(f"[red]append-only: FAILED[/red] {why}")
+                raise typer.Exit(code=1)
+
+        repo_full_name = None
+        issue_number = None
+        if issue is not None:
+            repo_full_name, issue_number = parse_issue_reference(issue)
+
+        events = audit.list_events(
+            conn,
+            repo_full_name=repo_full_name,
+            issue_number=issue_number,
+            event=event,
+            limit=limit,
+        )
+        if not events:
+            console.print("no audit events")
+            return
+
+        table = Table(title=f"audit log ({audit.count_events(conn)} total)")
+        table.add_column("when")
+        table.add_column("event")
+        table.add_column("issue")
+        table.add_column("severity")
+        table.add_column("detail")
+        for item in events:
+            ref = (
+                f"{item.repo_full_name}#{item.issue_number}"
+                if item.repo_full_name and item.issue_number
+                else "-"
+            )
+            table.add_row(
+                item.created_at.strftime("%Y-%m-%d %H:%M:%S") if item.created_at else "-",
+                item.event,
+                ref,
+                item.severity,
+                item.detail[:60],
+            )
+        console.print(table)
+    finally:
+        conn.close()
 
 
 if __name__ == "__main__":
