@@ -51,10 +51,24 @@ LEGAL_TRANSITIONS: dict[TaskState, frozenset[TaskState]] = {
         {TaskState.VALIDATING, TaskState.FAILED_VALIDATION, TaskState.DISCARDED}
     ),
     TaskState.VALIDATING: frozenset(
-        {TaskState.AWAITING_PUBLISH_APPROVAL, TaskState.FAILED_VALIDATION}
+        {
+            TaskState.AWAITING_PUBLISH_APPROVAL,
+            TaskState.FAILED_VALIDATION,
+            # A reviewer can send a patch back for another attempt, or abandon
+            # the task, without it having passed validation first.
+            TaskState.IMPLEMENTING,
+            TaskState.DISCARDED,
+        }
     ),
     TaskState.FAILED_VALIDATION: frozenset({TaskState.IMPLEMENTING, TaskState.DISCARDED}),
-    TaskState.AWAITING_PUBLISH_APPROVAL: frozenset({TaskState.PUBLISHED, TaskState.DISCARDED}),
+    TaskState.AWAITING_PUBLISH_APPROVAL: frozenset(
+        {
+            TaskState.PUBLISHED,
+            TaskState.DISCARDED,
+            # A reviewer can withdraw approval and ask for changes instead.
+            TaskState.IMPLEMENTING,
+        }
+    ),
     TaskState.PUBLISHED: frozenset({TaskState.MERGED, TaskState.CLOSED}),
     TaskState.MERGED: frozenset(),
     TaskState.CLOSED: frozenset(),
@@ -615,3 +629,62 @@ class KillSwitchState(BaseModel):
     reason: str = ""
     changed_by: str = ""
     changed_at: datetime | None = None
+
+
+class ApprovalAction(StrEnum):
+    """The four approval-boundary actions (SPEC section 8)."""
+
+    APPROVE = "approve"
+    REQUEST_CHANGES = "request_changes"
+    REJECT = "reject"
+    DISCARD = "discard"
+
+
+class ApprovalRecord(BaseModel):
+    """A human decision bound to one exact patch (SPEC sections 8 and 10).
+
+    The binding is the point. An approval records the patch hash, the target
+    repository, and the target branch it was given for, so a later change to any
+    of them invalidates it. ``is_valid_for`` performs that check.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: int | None = None
+    created_at: datetime | None = None
+    repo_full_name: str
+    issue_number: int
+    action: ApprovalAction
+    patch_sha256: str = Field(min_length=64, max_length=64)
+    target_branch: str = ""
+    actor: str = "operator"
+    reason: str = ""
+    # True once a later patch or a newer decision supersedes this one.
+    superseded: bool = False
+
+    def is_valid_for(
+        self,
+        *,
+        patch_sha256: str,
+        repo_full_name: str,
+        target_branch: str,
+    ) -> tuple[bool, str]:
+        """Whether this approval still authorizes publishing the given patch.
+
+        Every mismatch returns a specific reason, so the operator learns which
+        of the four bindings changed rather than a generic refusal.
+        """
+        if self.superseded:
+            return False, "this approval was superseded by a newer decision"
+        if self.action is not ApprovalAction.APPROVE:
+            return False, f"the latest decision was '{self.action.value}', not 'approve'"
+        if self.repo_full_name != repo_full_name:
+            return False, (f"approval was for {self.repo_full_name}, not {repo_full_name}")
+        if self.patch_sha256 != patch_sha256:
+            return False, (
+                "the patch changed since approval "
+                f"(approved {self.patch_sha256[:12]}, now {patch_sha256[:12]})"
+            )
+        if self.target_branch != target_branch:
+            return False, (f"approval was for branch {self.target_branch!r}, not {target_branch!r}")
+        return True, ""

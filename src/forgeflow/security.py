@@ -58,10 +58,12 @@ _PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("assigned_secret", re.compile(r"(?i)\b(secret|password|passwd|credential)\b\s*[:=]\s*\S+")),
 )
 
-# A long unbroken run of hex or base64-ish characters with no spaces is treated
-# as a possible credential. 40 is above the length of a git SHA-1 in practice
-# being confused, and well below real token lengths.
+# A long unbroken run of base64-ish characters with no spaces is treated as a
+# possible credential. A pure hex run is excluded: a SHA-1 or SHA-256 digest is
+# a content hash, not a secret, and redacting it would destroy the audit trail
+# that binds an approval to an exact patch.
 _ENTROPY_CANDIDATE = re.compile(r"\b[A-Za-z0-9+/=_\-]{40,}\b")
+_PURE_HEX = re.compile(r"^[0-9a-fA-F]+$")
 
 
 def redact(text: str, *, extra_secrets: tuple[str, ...] = ()) -> str:
@@ -84,8 +86,21 @@ def redact(text: str, *, extra_secrets: tuple[str, ...] = ()) -> str:
     for _name, pattern in _PATTERNS:
         result = pattern.sub(REDACTED, result)
 
-    result = _ENTROPY_CANDIDATE.sub(REDACTED, result)
+    result = _ENTROPY_CANDIDATE.sub(_redact_unless_hex, result)
     return result
+
+
+def _redact_unless_hex(match: re.Match[str]) -> str:
+    """Redact a candidate, unless it is a plain hex digest.
+
+    Called for each entropy candidate. A 40- or 64-character hex string is
+    almost always a git object id or a content hash, both of which are useful
+    evidence and neither of which is a credential.
+    """
+    value = match.group(0)
+    if len(value) in (40, 64) and _PURE_HEX.match(value):
+        return value
+    return REDACTED
 
 
 def environment_secrets() -> tuple[str, ...]:

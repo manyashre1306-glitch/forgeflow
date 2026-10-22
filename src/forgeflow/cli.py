@@ -18,9 +18,10 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from forgeflow import audit, killswitch, storage
+from forgeflow import approval, audit, killswitch
 from forgeflow import report as report_module
 from forgeflow.agent_runner import AgentUnavailableError, get_agent
+from forgeflow.approval import ApprovalError, storage
 from forgeflow.config import (
     AppConfig,
     ConfigError,
@@ -38,7 +39,12 @@ from forgeflow.issue_analyzer import (
     ModelUnavailableError,
     build_analyzer,
 )
-from forgeflow.models import Issue, TaskState
+from forgeflow.models import (
+    ApprovalAction,
+    IllegalTransitionError,
+    Issue,
+    TaskState,
+)
 from forgeflow.pipeline import PipelineError, run_analysis, run_context, run_implement, run_review
 from forgeflow.ranking import rank_issues, resolve_weights, total_for
 from forgeflow.repository_context import (
@@ -812,6 +818,124 @@ def audit_log(
         console.print(table)
     finally:
         conn.close()
+
+
+def _approval_common(
+    issue: str,
+    db_path: Path,
+    config_path: Path,
+    target_branch: str,
+    actor: str,
+    reason: str,
+    action: ApprovalAction,
+) -> None:
+    """Shared body for the four approval commands.
+
+    Kept in one place so the four actions cannot drift apart in how they check
+    the kill switch or report a failure.
+    """
+    repo_full_name, number = parse_issue_reference(issue)
+    try:
+        config = load_app_config(config_path)
+        conn = open_db(db_path)
+        require_kill_switch_clear(config, None, conn)
+    except KillSwitchEngagedError as exc:
+        console.print(f"[red]kill switch:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    except ForgeFlowError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    try:
+        decision, state = approval.apply_action(
+            conn,
+            repo_full_name,
+            number,
+            action,
+            actor=actor,
+            reason=reason,
+            target_branch=target_branch,
+        )
+    except (ApprovalError, IllegalTransitionError) as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    finally:
+        conn.close()
+
+    console.print(f"{action.value}: {repo_full_name}#{number}")
+    console.print(f"  patch sha256: {decision.patch_sha256}")
+    console.print(f"  actor:        {decision.actor}")
+    console.print(f"  state:        {state.value}")
+    if action is ApprovalAction.APPROVE:
+        console.print(
+            "[yellow]note:[/yellow] this approval is bound to that exact patch hash. "
+            "If the patch changes, approval must be given again."
+        )
+
+
+@app.command()
+def approve(
+    issue: Annotated[str, typer.Argument(help="Issue reference, e.g. owner/repo#123.")],
+    db_path: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
+    config_path: Annotated[Path, typer.Option("--config")] = DEFAULT_CONFIG_PATH,
+    target_branch: Annotated[
+        str, typer.Option("--target-branch", help="Branch the patch is approved for.")
+    ] = "",
+    actor: Annotated[str, typer.Option("--actor", help="Who is approving.")] = "operator",
+    reason: Annotated[str, typer.Option("--reason")] = "",
+) -> None:
+    """Approve the latest patch for publishing, bound to its exact hash.
+
+    This records consent only. Nothing is published: publishing is Phase 4.
+    """
+    _approval_common(
+        issue, db_path, config_path, target_branch, actor, reason, ApprovalAction.APPROVE
+    )
+
+
+@app.command("request-changes")
+def request_changes(
+    issue: Annotated[str, typer.Argument(help="Issue reference, e.g. owner/repo#123.")],
+    db_path: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
+    config_path: Annotated[Path, typer.Option("--config")] = DEFAULT_CONFIG_PATH,
+    target_branch: Annotated[str, typer.Option("--target-branch")] = "",
+    actor: Annotated[str, typer.Option("--actor")] = "operator",
+    reason: Annotated[str, typer.Option("--reason", help="What must change.")] = "",
+) -> None:
+    """Send the task back to implementing for another attempt."""
+    _approval_common(
+        issue, db_path, config_path, target_branch, actor, reason, ApprovalAction.REQUEST_CHANGES
+    )
+
+
+@app.command()
+def reject(
+    issue: Annotated[str, typer.Argument(help="Issue reference, e.g. owner/repo#123.")],
+    db_path: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
+    config_path: Annotated[Path, typer.Option("--config")] = DEFAULT_CONFIG_PATH,
+    target_branch: Annotated[str, typer.Option("--target-branch")] = "",
+    actor: Annotated[str, typer.Option("--actor")] = "operator",
+    reason: Annotated[str, typer.Option("--reason")] = "",
+) -> None:
+    """Reject the patch. The task is discarded."""
+    _approval_common(
+        issue, db_path, config_path, target_branch, actor, reason, ApprovalAction.REJECT
+    )
+
+
+@app.command()
+def discard(
+    issue: Annotated[str, typer.Argument(help="Issue reference, e.g. owner/repo#123.")],
+    db_path: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
+    config_path: Annotated[Path, typer.Option("--config")] = DEFAULT_CONFIG_PATH,
+    target_branch: Annotated[str, typer.Option("--target-branch")] = "",
+    actor: Annotated[str, typer.Option("--actor")] = "operator",
+    reason: Annotated[str, typer.Option("--reason")] = "",
+) -> None:
+    """Abandon the task without judging the patch."""
+    _approval_common(
+        issue, db_path, config_path, target_branch, actor, reason, ApprovalAction.DISCARD
+    )
 
 
 if __name__ == "__main__":
