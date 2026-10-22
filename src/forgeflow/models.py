@@ -137,6 +137,9 @@ class Issue(BaseModel):
     labels: list[str] = Field(default_factory=list)
     url: str = ""
     comments_count: int = Field(default=0, ge=0)
+    assignees: list[str] = Field(default_factory=list)
+    is_pull_request: bool = False
+    linked_open_prs: list[int] = Field(default_factory=list)
     created_at: datetime | None = None
     updated_at: datetime | None = None
     task_state: TaskState = TaskState.DISCOVERED
