@@ -175,3 +175,81 @@ or push is performed by any code path added in this phase. The `CodingAgent`
 interface has no publish method, `automationMode` is never sent to Jules, and the
 sandbox refuses to run at all. Publication remains Phase 4 work behind the
 approval gate.
+
+---
+
+## 8. End-of-phase verification (real output)
+
+Run against SPEC section 13 (Phase 2 deliverables) and section 14 (testing
+requirements). Output reproduced verbatim.
+
+```
+=== SPEC 13: Phase 2 deliverables ===
+  repository context extraction : PASS  repository_context.py
+  agent-provider adapter        : PASS  agent_runner.py (CodingAgent, JulesAgent, MockAgent)
+  issue analysis                : PASS  issue_analyzer.py
+  isolated workspaces           : PASS  sandbox.py (refuses without a runtime)
+  patch generation              : PASS  patch.py
+  local review reports          : PASS  review.py
+
+=== SPEC 14: required tests, verified by behaviour ===
+  patch-hash validation         : PASS
+  modified patch invalidates    : PASS
+  cost limits configured        : PASS
+  missing JULES key fails safe  : PASS
+  missing GEMINI key fails safe : PASS
+  injection text stays fenced   : PASS
+  agent has no publish method   : PASS
+  no isolation -> refusal       : PASS (isolated=False)
+
+=== no external write actions in Phase 2 code ===
+  grep for write actions        : 0 match(es)
+```
+
+The write-action grep covers `requests.post/put/patch/delete`, `urlopen` with a
+write method, `git push`, `git commit`, `create_pull_request`, and a literal
+`automationMode` key. It returns zero matches across `src/forgeflow/`.
+
+Gate results at the end of the phase:
+
+```
+$ uv run python -m ruff check .
+All checks passed!
+
+$ uv run python -m ruff format --check .
+41 files already formatted
+
+$ uv run python -m pytest -q
+469 passed in 5.12s
+```
+
+### Test growth across the phase
+
+| Step | Commit | Tests |
+| --- | --- | --- |
+| 2.1 repository context | `0ba0202` | 304 |
+| 2.2 agent evaluation | `f02bf90` | 304 |
+| 2.3 agent adapter | `f6b68c1` | 336 |
+| 2.4 issue analysis | `b5e4c84` | 388 |
+| 2.5 sandbox | `a195ddc` | 419 |
+| 2.6 patch + review + CLI | `3a3c9d2` | 469 |
+
+### What was verified by running the CLI, not just unit tests
+
+Against a local fixture repository at `/tmp`, with no network:
+
+- `context` extracted the contribution rules and reported
+  `AI policy: unknown`, `requires tests: True`, `requires signoff: True`, and
+  moved the task to `shortlisted`.
+- `analyze` failed closed with
+  `model unavailable: GEMINI_API_KEY is not set; refusing to call the model API.`
+  and exit code 1.
+- `implement --provider mock` warned that no isolation was available, captured a
+  patch (`files: 1`, `+4 -1`), printed the SHA-256, and moved the task to
+  `validating`.
+- `review` wrote a bundle whose diff section contains the full patch and whose
+  header states plainly that the patch was not executed or tested.
+
+Both the `analyze` refusal and the `implement` warning are real output from this
+environment, not descriptions of intended behaviour.
+
