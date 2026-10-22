@@ -224,3 +224,100 @@ class RankedIssue(BaseModel):
         if self.score.issue_number != self.issue.number:
             raise ValueError("score issue_number does not match issue number")
         return self
+
+
+# --------------------------------------------------------------------------
+# Phase 2: untrusted text handling
+# --------------------------------------------------------------------------
+
+
+class TrustLevel(StrEnum):
+    """Provenance of a piece of text.
+
+    Only one level exists today: repository and issue text is always untrusted.
+    The enum is explicit so that a prompt can be built by *trust level* rather
+    than by accident, and so that adding a trusted level later is a visible
+    change rather than a silent default.
+    """
+
+    UNTRUSTED = "untrusted"
+
+
+class UntrustedText(BaseModel):
+    """A block of text that must never be interpreted as instructions.
+
+    SPEC section 16 and the Phase 2 threat model require that repository and
+    issue content is treated strictly as data. Wrapping it in this model keeps
+    the provenance attached to the text everywhere it travels, and
+    :meth:`to_prompt_block` renders it inside a fence that names its origin.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    text: str
+    source: str
+    trust: TrustLevel = TrustLevel.UNTRUSTED
+    truncated: bool = False
+    original_length: int = 0
+
+    def to_prompt_block(self) -> str:
+        """Render the text inside an explicit untrusted-data fence."""
+        note = " (truncated)" if self.truncated else ""
+        return (
+            f"<<<BEGIN UNTRUSTED DATA: {self.source}{note}>>>\n"
+            f"{self.text}\n"
+            f"<<<END UNTRUSTED DATA: {self.source}>>>"
+        )
+
+
+class AIPolicy(StrEnum):
+    """What a repository's contribution rules say about AI-generated work."""
+
+    PROHIBITED = "prohibited"
+    RESTRICTED = "restricted"
+    ALLOWED = "allowed"
+    UNKNOWN = "unknown"
+
+
+class ContributionRules(BaseModel):
+    """Rules detected from a repository's contribution guidance.
+
+    Detection is keyword based and deliberately conservative: every non-unknown
+    verdict carries the verbatim line that produced it, so a human can check it.
+    """
+
+    ai_policy: AIPolicy = AIPolicy.UNKNOWN
+    ai_policy_evidence: list[str] = Field(default_factory=list)
+    requires_tests: bool = False
+    requires_signoff: bool = False
+    requires_cla: bool = False
+    sources: list[str] = Field(default_factory=list)
+
+
+class FileExcerpt(BaseModel):
+    """One repository file, size-limited and marked untrusted."""
+
+    path: str
+    size_bytes: int
+    content: UntrustedText
+
+
+class RepoContext(BaseModel):
+    """Everything the analyzer needs about a shortlisted issue (SPEC 2D).
+
+    Every free-text field is an :class:`UntrustedText`; there is no plain string
+    field carrying repository or issue prose.
+    """
+
+    repo_full_name: str
+    issue_number: int
+    workspace_path: str
+    issue: UntrustedText
+    readme: UntrustedText | None = None
+    contributing: list[UntrustedText] = Field(default_factory=list)
+    test_layout: list[str] = Field(default_factory=list)
+    relevant_files: list[FileExcerpt] = Field(default_factory=list)
+    contribution_rules: ContributionRules = Field(default_factory=ContributionRules)
+    total_bytes: int = 0
+    truncated: bool = False
+    cloned_at: datetime | None = None

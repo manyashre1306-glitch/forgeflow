@@ -16,9 +16,10 @@ venv/
 # Secrets and local environment
 .env
 
-# Local data: database and generated reports
+# Local data: database, generated reports, and cloned workspaces
 data/*.db
 data/reports/
+data/workspaces/
 
 # OS / editor noise
 .DS_Store
