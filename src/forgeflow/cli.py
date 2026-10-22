@@ -20,12 +20,22 @@ from rich.table import Table
 
 from forgeflow import report as report_module
 from forgeflow import storage
+from forgeflow.agent_runner import AgentUnavailableError, get_agent
 from forgeflow.config import AppConfig, ConfigError, Settings, load_config
 from forgeflow.dedupe import DroppedIssue, deduplicate, filter_issues
 from forgeflow.discovery import DiscoveryResult, collect_linked_open_prs, discover_issues
 from forgeflow.github_client import GitHubClient, GitHubError, GitHubReader, MissingTokenError
+from forgeflow.issue_analyzer import (
+    AnalyzerError,
+    BudgetExceededError,
+    ModelUnavailableError,
+    build_analyzer,
+)
 from forgeflow.models import Issue, TaskState
+from forgeflow.pipeline import PipelineError, run_analysis, run_context, run_implement, run_review
 from forgeflow.ranking import rank_issues, resolve_weights, total_for
+from forgeflow.repository_context import RepositoryContextError
+from forgeflow.sandbox import IsolationError, build_sandbox
 
 DEFAULT_CONFIG_PATH = Path("config/repositories.yaml")
 DEFAULT_DB_PATH = Path("data/forgeflow.db")
@@ -369,6 +379,213 @@ def shortlist(
         f"{updated.repo_full_name}#{updated.number} is now "
         f"[green]{updated.task_state.value}[/green]"
     )
+
+
+# --------------------------------------------------------------------------
+# Phase 2 commands: context, analyze, implement, review
+# --------------------------------------------------------------------------
+
+
+@app.command()
+def context(
+    issue: Annotated[str, typer.Argument(help="Issue reference, e.g. pydantic/pydantic#1234.")],
+    db_path: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
+    workspace_root: Annotated[Path, typer.Option("--workspace-root")] = Path("data/workspaces"),
+    local_path: Annotated[
+        Path | None,
+        typer.Option("--local-path", help="Clone from a local path instead of GitHub."),
+    ] = None,
+) -> None:
+    """Extract a repository context bundle for an issue (read-only)."""
+    repo_full_name, number = parse_issue_reference(issue)
+    try:
+        conn = open_db(db_path)
+    except ForgeFlowError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    try:
+        outcome = run_context(
+            conn,
+            repo_full_name,
+            number,
+            workspace_root=workspace_root,
+            source_path=local_path,
+            clone=True,
+        )
+    except (PipelineError, RepositoryContextError, GitHubError) as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    finally:
+        conn.close()
+
+    ctx = outcome.context
+    rules = ctx.contribution_rules
+    console.print(f"Context built for [bold]{repo_full_name}#{number}[/bold]")
+    console.print(f"  workspace:        {ctx.workspace_path}")
+    console.print(f"  relevant files:   {len(ctx.relevant_files)}")
+    console.print(f"  test entries:     {len(ctx.test_layout)}")
+    console.print(f"  total bytes:      {ctx.total_bytes}")
+    console.print(f"  truncated:        {ctx.truncated}")
+    console.print(f"  AI policy:        [bold]{rules.ai_policy.value}[/bold]")
+    console.print(f"  requires tests:   {rules.requires_tests}")
+    console.print(f"  requires signoff: {rules.requires_signoff}")
+    console.print(f"  task state:       {outcome.issue.task_state.value}")
+    if rules.ai_policy.value == "unknown":
+        console.print(
+            "[yellow]note:[/yellow] no AI policy found in repository guidance; "
+            "unknown is not permission."
+        )
+
+
+@app.command()
+def analyze(
+    issue: Annotated[str, typer.Argument(help="Issue reference, e.g. pydantic/pydantic#1234.")],
+    db_path: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
+    config_path: Annotated[Path, typer.Option("--config")] = DEFAULT_CONFIG_PATH,
+    workspace_root: Annotated[Path, typer.Option("--workspace-root")] = Path("data/workspaces"),
+    skip_triage: Annotated[
+        bool, typer.Option("--skip-triage", help="Analyse without the cheap triage call.")
+    ] = False,
+) -> None:
+    """Analyse an issue with the configured models, then await plan approval."""
+    repo_full_name, number = parse_issue_reference(issue)
+    try:
+        config = load_app_config(config_path)
+        conn = open_db(db_path)
+    except ForgeFlowError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    try:
+        analyzer = build_analyzer(config.llm, conn=conn)
+        outcome = run_analysis(
+            conn,
+            analyzer,
+            repo_full_name,
+            number,
+            workspace_root=workspace_root,
+            skip_triage=skip_triage,
+        )
+    except BudgetExceededError as exc:
+        console.print(f"[red]budget:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    except ModelUnavailableError as exc:
+        console.print(f"[red]model unavailable:[/red] {exc}")
+        console.print(
+            "[yellow]note:[/yellow] set GEMINI_API_KEY in the environment to enable analysis."
+        )
+        raise typer.Exit(code=1) from exc
+    except (AnalyzerError, PipelineError, RepositoryContextError) as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    finally:
+        conn.close()
+
+    result = outcome.analysis
+    console.print(f"Analysis for [bold]{repo_full_name}#{number}[/bold]")
+    console.print(f"  problem:  {result.problem_explanation.strip()}")
+    console.print(f"  fix:      {result.minimal_fix_proposal.strip()}")
+    console.print(f"  risks:    {len(result.risks)}")
+    console.print(f"  tests:    {len(result.test_plan)}")
+    console.print(f"  state:    [green]{outcome.issue.task_state.value}[/green]")
+
+
+@app.command()
+def implement(
+    issue: Annotated[str, typer.Argument(help="Issue reference, e.g. pydantic/pydantic#1234.")],
+    db_path: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
+    workspace_root: Annotated[Path, typer.Option("--workspace-root")] = Path("data/workspaces"),
+    provider: Annotated[
+        str, typer.Option("--provider", help="Coding agent provider: mock or jules.")
+    ] = "mock",
+    plan: Annotated[
+        str, typer.Option("--plan", help="Approved plan text handed to the agent.")
+    ] = "",
+    allow_external: Annotated[
+        bool,
+        typer.Option("--allow-external", help="Acknowledge that the provider is a remote service."),
+    ] = False,
+) -> None:
+    """Run a coding agent on an approved plan and record a hashed patch.
+
+    The task must be at 'awaiting_plan_approval'. With no container isolation the
+    patch is recorded as unverified, and the review report says so.
+    """
+    repo_full_name, number = parse_issue_reference(issue)
+    if not plan:
+        console.print("[red]error:[/red] --plan is required (the approved plan text)")
+        raise typer.Exit(code=1)
+
+    try:
+        conn = open_db(db_path)
+    except ForgeFlowError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    sandbox = build_sandbox()
+    if not sandbox.is_isolated:
+        console.print("[yellow]warning:[/yellow] no container isolation available.")
+        console.print(
+            "  Repository code will NOT be executed. Only the agent's own diff will be captured."
+        )
+
+    try:
+        agent = get_agent(provider, allow_external=allow_external)
+        outcome = run_implement(
+            conn,
+            agent,
+            sandbox,
+            repo_full_name,
+            number,
+            plan,
+            workspace_root=workspace_root,
+        )
+    except (AgentUnavailableError, IsolationError, PipelineError, RepositoryContextError) as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    finally:
+        conn.close()
+
+    patch = outcome.patch
+    console.print(f"Implementation for [bold]{repo_full_name}#{number}[/bold]")
+    console.print(f"  provider:   {outcome.agent_result.provider}")
+    if patch is not None:
+        console.print(f"  files:      {patch.files_changed}")
+        console.print(f"  +{patch.additions} -{patch.deletions}")
+        console.print(f"  sha256:     {patch.patch_sha256}")
+    else:
+        console.print("  patch:      none produced")
+    console.print(f"  state:      {outcome.issue.task_state.value}")
+
+
+@app.command()
+def review(
+    issue: Annotated[str, typer.Argument(help="Issue reference, e.g. pydantic/pydantic#1234.")],
+    db_path: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
+    report_dir: Annotated[Path, typer.Option("--report-dir")] = Path("data/reports"),
+) -> None:
+    """Write a local Markdown review bundle for an issue (read-only)."""
+    repo_full_name, number = parse_issue_reference(issue)
+    try:
+        conn = open_db(db_path)
+    except ForgeFlowError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    try:
+        outcome = run_review(conn, repo_full_name, number, report_dir=report_dir)
+    except PipelineError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    finally:
+        conn.close()
+
+    console.print(f"Review bundle written to [bold]{outcome.report_path}[/bold]")
+    if outcome.patch is None:
+        console.print("  no patch recorded for this issue")
+    else:
+        console.print(f"  patch sha256: {outcome.patch.patch_sha256}")
 
 
 if __name__ == "__main__":

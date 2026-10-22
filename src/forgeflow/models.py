@@ -407,3 +407,27 @@ def compute_cost_usd(
         prompt_tokens * pricing.input_per_million + completion_tokens * pricing.output_per_million
     ) / 1_000_000
     return round(cost, 6)
+
+
+class PatchRecord(BaseModel):
+    """A captured patch and its content hash (SPEC sections 2H and 2I).
+
+    The hash exists so approval can be bound to an exact change: if the patch
+    changes, the hash changes, and any earlier approval no longer applies.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: int | None = None
+    created_at: datetime | None = None
+    repo_full_name: str
+    issue_number: int
+    provider: str
+    session_id: str | None = None
+    patch_sha256: str = Field(min_length=64, max_length=64)
+    diff: str = ""
+    files_changed: int = Field(default=0, ge=0)
+    additions: int = Field(default=0, ge=0)
+    deletions: int = Field(default=0, ge=0)
+    isolated: bool = True
+    notes: str = ""

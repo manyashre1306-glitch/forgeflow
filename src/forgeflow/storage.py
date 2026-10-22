@@ -20,6 +20,7 @@ from forgeflow.models import (
     Issue,
     IssueScore,
     LLMUsage,
+    PatchRecord,
     Repository,
     TaskState,
     validate_transition,
@@ -87,6 +88,22 @@ CREATE TABLE IF NOT EXISTS excluded_issues (
     detail         TEXT NOT NULL DEFAULT '',
     recorded_at    TEXT NOT NULL,
     PRIMARY KEY (repo_full_name, number, reason)
+);
+
+CREATE TABLE IF NOT EXISTS patches (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at     TEXT NOT NULL,
+    repo_full_name TEXT NOT NULL,
+    issue_number   INTEGER NOT NULL,
+    provider       TEXT NOT NULL,
+    session_id     TEXT,
+    patch_sha256   TEXT NOT NULL,
+    diff           TEXT NOT NULL DEFAULT '',
+    files_changed  INTEGER NOT NULL DEFAULT 0,
+    additions      INTEGER NOT NULL DEFAULT 0,
+    deletions      INTEGER NOT NULL DEFAULT 0,
+    isolated       INTEGER NOT NULL DEFAULT 1,
+    notes          TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS llm_usage (
@@ -580,3 +597,81 @@ def total_tokens_in_month(conn: sqlite3.Connection, *, now: datetime | None = No
         (start.isoformat(),),
     ).fetchone()
     return int(row["total"])
+
+
+# --------------------------------------------------------------------------
+# Phase 2: patches
+# --------------------------------------------------------------------------
+
+
+def record_patch(conn: sqlite3.Connection, patch: PatchRecord) -> int:
+    """Insert one patch record and return its row id."""
+    cursor = conn.execute(
+        """
+        INSERT INTO patches (
+            created_at, repo_full_name, issue_number, provider, session_id,
+            patch_sha256, diff, files_changed, additions, deletions, isolated, notes
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            patch.created_at.isoformat() if patch.created_at else utcnow(),
+            patch.repo_full_name,
+            patch.issue_number,
+            patch.provider,
+            patch.session_id,
+            patch.patch_sha256,
+            patch.diff,
+            patch.files_changed,
+            patch.additions,
+            patch.deletions,
+            1 if patch.isolated else 0,
+            patch.notes,
+        ),
+    )
+    conn.commit()
+    return int(cursor.lastrowid or 0)
+
+
+def _row_to_patch(row: sqlite3.Row) -> PatchRecord:
+    created = row["created_at"]
+    return PatchRecord(
+        id=row["id"],
+        created_at=datetime.fromisoformat(created) if created else None,
+        repo_full_name=row["repo_full_name"],
+        issue_number=row["issue_number"],
+        provider=row["provider"],
+        session_id=row["session_id"],
+        patch_sha256=row["patch_sha256"],
+        diff=row["diff"],
+        files_changed=row["files_changed"],
+        additions=row["additions"],
+        deletions=row["deletions"],
+        isolated=bool(row["isolated"]),
+        notes=row["notes"],
+    )
+
+
+def list_patches(
+    conn: sqlite3.Connection,
+    repo_full_name: str | None = None,
+    issue_number: int | None = None,
+) -> list[PatchRecord]:
+    """Return recorded patches, newest last, optionally filtered to one issue."""
+    query = "SELECT * FROM patches"
+    params: list[object] = []
+    if repo_full_name is not None and issue_number is not None:
+        query += " WHERE repo_full_name = ? AND issue_number = ?"
+        params += [repo_full_name, issue_number]
+    query += " ORDER BY id"
+    rows = conn.execute(query, params).fetchall()
+    return [_row_to_patch(row) for row in rows]
+
+
+def latest_patch(
+    conn: sqlite3.Connection,
+    repo_full_name: str,
+    issue_number: int,
+) -> PatchRecord | None:
+    """Return the most recent patch for one issue, or None."""
+    patches = list_patches(conn, repo_full_name, issue_number)
+    return patches[-1] if patches else None
