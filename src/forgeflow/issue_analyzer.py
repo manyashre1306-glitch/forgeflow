@@ -30,6 +30,7 @@ import os
 import re
 import urllib.error
 import urllib.request
+from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Protocol, runtime_checkable
 
@@ -268,11 +269,13 @@ class IssueAnalyzer:
         *,
         budget_query: object = None,
         usage_recorder: object = None,
+        kill_switch_check: Callable[[], None] | None = None,
     ) -> None:
         self._backend = backend
         self._config = config
         self._budget_query = budget_query
         self._usage_recorder = usage_recorder
+        self._kill_switch_check = kill_switch_check
 
     @property
     def config(self) -> LLMConfig:
@@ -337,6 +340,10 @@ class IssueAnalyzer:
         purpose: str,
     ) -> dict[str, object]:
         """Call the model with bounded retries, recording every attempt."""
+        # The kill switch is checked first: it must be able to stop a call even
+        # when the budget check would have allowed it.
+        if self._kill_switch_check is not None:
+            self._kill_switch_check()
         self.check_budget()
 
         attempts = self._config.max_retries + 1
@@ -499,6 +506,7 @@ def build_analyzer(
     *,
     conn: object | None = None,
     backend: LLMBackend | None = None,
+    app_config: object = None,
 ) -> IssueAnalyzer:
     """Construct an analyzer with budget and usage tracking wired to SQLite.
 
@@ -509,11 +517,18 @@ def build_analyzer(
         backend = GeminiBackend()
     budget_query = make_budget_query(conn) if conn is not None else None
     usage_recorder = make_usage_recorder(conn) if conn is not None else None
+
+    def check_kill_switch() -> None:
+        from forgeflow.config import require_kill_switch_clear
+
+        require_kill_switch_clear(app_config)  # type: ignore[arg-type]
+
     return IssueAnalyzer(
         backend,
         config,
         budget_query=budget_query,
         usage_recorder=usage_recorder,
+        kill_switch_check=check_kill_switch,
     )
 
 

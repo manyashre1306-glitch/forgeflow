@@ -27,6 +27,7 @@ from __future__ import annotations
 import shutil
 import subprocess
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
@@ -218,10 +219,12 @@ class Sandbox:
         image: str = DEFAULT_IMAGE,
         limits: SandboxLimits | None = None,
         status: IsolationStatus | None = None,
+        kill_switch_check: Callable[[], None] | None = None,
     ) -> None:
         self._image = image
         self._limits = limits or SandboxLimits()
         self._status = status if status is not None else detect_backend()
+        self._kill_switch_check = kill_switch_check
 
     @property
     def limits(self) -> SandboxLimits:
@@ -271,6 +274,11 @@ class Sandbox:
         the command on the host.
         """
         effective = limits or self._limits
+
+        # Checked before isolation: the kill switch must stop execution whether
+        # or not a container is available.
+        if self._kill_switch_check is not None:
+            self._kill_switch_check()
 
         if not self._status.isolated:
             raise IsolationError(
@@ -346,6 +354,18 @@ def build_sandbox(
     *,
     image: str = DEFAULT_IMAGE,
     limits: SandboxLimits | None = None,
+    app_config: object = None,
 ) -> Sandbox:
-    """Construct a sandbox with detected isolation."""
-    return Sandbox(image=image, limits=limits, status=detect_backend())
+    """Construct a sandbox with detected isolation and the kill switch wired in."""
+
+    def check_kill_switch() -> None:
+        from forgeflow.config import require_kill_switch_clear
+
+        require_kill_switch_clear(app_config)  # type: ignore[arg-type]
+
+    return Sandbox(
+        image=image,
+        limits=limits,
+        status=detect_backend(),
+        kill_switch_check=check_kill_switch,
+    )

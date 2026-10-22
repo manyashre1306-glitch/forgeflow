@@ -11,6 +11,7 @@ step here, and no code path in this module contacts a remote for writing.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -20,7 +21,14 @@ from forgeflow import storage
 from forgeflow.agent_runner import AgentResult, CodingAgent
 from forgeflow.config import AppConfig
 from forgeflow.issue_analyzer import IssueAnalyzer
-from forgeflow.models import AnalysisResult, Issue, PatchRecord, RepoContext, TaskState
+from forgeflow.models import (
+    AnalysisRecord,
+    AnalysisResult,
+    Issue,
+    PatchRecord,
+    RepoContext,
+    TaskState,
+)
 from forgeflow.patch import PatchError, build_patch_record, workspace_diff
 from forgeflow.repository_context import prepare_repo_context, workspace_path_for
 from forgeflow.review import review_report_path, write_review_report
@@ -29,6 +37,60 @@ from forgeflow.sandbox import Sandbox
 
 class PipelineError(RuntimeError):
     """A user-facing pipeline failure."""
+
+
+# States in which an analysis has already been produced and approved or acted
+# on. Re-analysing from here would spend money again for no new information.
+POST_ANALYSIS_STATES = frozenset(
+    {
+        TaskState.AWAITING_PLAN_APPROVAL,
+        TaskState.IMPLEMENTING,
+        TaskState.VALIDATING,
+        TaskState.FAILED_VALIDATION,
+        TaskState.AWAITING_PUBLISH_APPROVAL,
+        TaskState.PUBLISHED,
+        TaskState.MERGED,
+    }
+)
+
+
+def _persist_analysis(
+    conn: sqlite3.Connection,
+    repo_full_name: str,
+    issue_number: int,
+    analysis: AnalysisResult,
+    model: str,
+) -> AnalysisRecord:
+    """Write an analysis to storage and return the stored record."""
+    record = AnalysisRecord(
+        created_at=datetime.now(UTC),
+        repo_full_name=repo_full_name,
+        issue_number=issue_number,
+        model=model,
+        confidence=analysis.confidence,
+        payload_json=analysis.model_dump_json(),
+    )
+    record.id = storage.record_analysis(conn, record)
+    return record
+
+
+def load_analysis(
+    conn: sqlite3.Connection,
+    repo_full_name: str,
+    issue_number: int,
+) -> AnalysisResult | None:
+    """Read back the most recent stored analysis, or None.
+
+    A stored payload that no longer validates returns None rather than raising:
+    the schema may have moved on, and a stale row should not break a review run.
+    """
+    record = storage.latest_analysis(conn, repo_full_name, issue_number)
+    if record is None:
+        return None
+    try:
+        return AnalysisResult.model_validate(json.loads(record.payload_json))
+    except (ValueError, TypeError):
+        return None
 
 
 @dataclass
@@ -130,13 +192,28 @@ def run_analysis(
     context: RepoContext | None = None,
     workspace_root: Path | str = "data/workspaces",
     skip_triage: bool = False,
+    force: bool = False,
 ) -> AnalysisOutcome:
     """Analyse an issue, then move it to ``awaiting_plan_approval``.
 
     The move to ``awaiting_plan_approval`` is the spec's gate: implementation
     requires a human to approve the plan first.
+
+    Idempotence (SPEC section 10): once an analysis exists and the task has
+    reached the approval gate, re-running would spend money again for the same
+    answer, so this refuses unless ``force`` is set. A stored analysis is
+    returned unchanged in that case.
     """
     issue = _load_issue(conn, repo_full_name, issue_number)
+
+    if not force and issue.task_state in POST_ANALYSIS_STATES:
+        stored = load_analysis(conn, repo_full_name, issue_number)
+        if stored is not None:
+            raise PipelineError(
+                f"{repo_full_name}#{issue_number} already has an analysis and is at "
+                f"'{issue.task_state.value}'. Re-analysing would spend again; pass "
+                f"force=True to replace it."
+            )
 
     if issue.task_state is TaskState.DISCOVERED:
         issue = storage.transition_task_state(
@@ -155,6 +232,13 @@ def run_analysis(
         context = build_repo_context(repo_full_name, issue, workspace)
 
     analysis = analyzer.analyze(context, skip_triage=skip_triage)
+    _persist_analysis(
+        conn,
+        repo_full_name,
+        issue_number,
+        analysis,
+        model=analyzer.config.analysis_model,
+    )
 
     if issue.task_state is TaskState.SHORTLISTED:
         issue = storage.transition_task_state(
@@ -289,6 +373,9 @@ def run_review(
     regenerated later without re-running the agent.
     """
     issue = _load_issue(conn, repo_full_name, issue_number)
+
+    if analysis is None:
+        analysis = load_analysis(conn, repo_full_name, issue_number)
 
     if patch is None:
         patch = storage.latest_patch(conn, repo_full_name, issue_number)

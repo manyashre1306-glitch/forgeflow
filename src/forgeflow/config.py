@@ -16,6 +16,7 @@ from pathlib import Path
 
 import yaml
 from pydantic import (
+    AliasChoices,
     BaseModel,
     ConfigDict,
     Field,
@@ -27,6 +28,8 @@ from pydantic import (
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from forgeflow.models import DEFAULT_WEIGHTS, SCORE_FACTORS, ModelPricing
+
+KILL_SWITCH_ENV = "FORGEFLOW_KILL_SWITCH"
 
 
 class ConfigError(ValueError):
@@ -76,6 +79,7 @@ class AppConfig(BaseModel):
     opt_out_labels: list[str] = Field(default_factory=list)
     preferred_labels: list[str] = Field(default_factory=list)
     llm: LLMConfig = Field(default_factory=lambda: LLMConfig())
+    kill_switch: bool = False
 
     @field_validator("repositories")
     @classmethod
@@ -128,6 +132,59 @@ class Settings(BaseSettings):
     github_token: SecretStr | None = Field(default=None)
     llm_api_key: SecretStr | None = Field(default=None)
     llm_provider: str = Field(default="gemini")
+    # pydantic-settings would otherwise read the bare name KILL_SWITCH. The
+    # documented, namespaced variable is accepted explicitly, and the bare name
+    # is still honoured so an existing environment keeps working.
+    kill_switch: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(KILL_SWITCH_ENV, "KILL_SWITCH"),
+    )
+
+
+class KillSwitchEngagedError(RuntimeError):
+    """Raised when the kill switch is engaged and an action was requested.
+
+    SPEC section 9 requires a kill switch. It is deliberately a hard stop rather
+    than a warning: the point of a kill switch is that flipping one flag halts
+    spending and execution without anyone having to remember which code paths
+    matter.
+    """
+
+
+def kill_switch_engaged(
+    config: AppConfig | None = None,
+    settings: Settings | None = None,
+) -> tuple[bool, str]:
+    """Report whether the kill switch is engaged, and why.
+
+    Two independent sources, so either one alone is enough to stop the system:
+    ``kill_switch: true`` in ``config/repositories.yaml``, or
+    ``FORGEFLOW_KILL_SWITCH`` set to a truthy value in the environment. The
+    environment route matters because it can be set on a running deployment
+    without editing a file that might be under review.
+    """
+    if config is not None and config.kill_switch:
+        return True, "kill_switch is enabled in the configuration file"
+
+    resolved = settings if settings is not None else Settings()
+    if resolved.kill_switch:
+        return True, f"{KILL_SWITCH_ENV} is set in the environment"
+
+    return False, ""
+
+
+def require_kill_switch_clear(
+    config: AppConfig | None = None,
+    settings: Settings | None = None,
+) -> None:
+    """Raise if the kill switch is engaged. No-op otherwise."""
+    engaged, reason = kill_switch_engaged(config, settings)
+    if engaged:
+        raise KillSwitchEngagedError(
+            f"kill switch engaged ({reason}); refusing to continue. Unset "
+            f"{KILL_SWITCH_ENV} or set kill_switch: false in the configuration "
+            f"file to resume."
+        )
 
 
 def load_config(path: str | Path) -> AppConfig:

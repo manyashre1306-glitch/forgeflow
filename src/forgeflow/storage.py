@@ -17,6 +17,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from forgeflow.models import (
+    AnalysisRecord,
     Issue,
     IssueScore,
     LLMUsage,
@@ -104,6 +105,18 @@ CREATE TABLE IF NOT EXISTS patches (
     deletions      INTEGER NOT NULL DEFAULT 0,
     isolated       INTEGER NOT NULL DEFAULT 1,
     notes          TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS analyses (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at     TEXT NOT NULL,
+    repo_full_name TEXT NOT NULL,
+    issue_number   INTEGER NOT NULL,
+    model          TEXT NOT NULL,
+    confidence     REAL NOT NULL DEFAULT 0.0,
+    payload_json   TEXT NOT NULL,
+    FOREIGN KEY (repo_full_name, issue_number)
+        REFERENCES issues(repo_full_name, number)
 );
 
 CREATE TABLE IF NOT EXISTS llm_usage (
@@ -675,3 +688,76 @@ def latest_patch(
     """Return the most recent patch for one issue, or None."""
     patches = list_patches(conn, repo_full_name, issue_number)
     return patches[-1] if patches else None
+
+
+# --------------------------------------------------------------------------
+# Phase 2: analyses
+# --------------------------------------------------------------------------
+
+
+def record_analysis(conn: sqlite3.Connection, record: AnalysisRecord) -> int:
+    """Insert one analysis and return its row id."""
+    cursor = conn.execute(
+        """
+        INSERT INTO analyses (
+            created_at, repo_full_name, issue_number, model, confidence, payload_json
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            record.created_at.isoformat() if record.created_at else utcnow(),
+            record.repo_full_name,
+            record.issue_number,
+            record.model,
+            record.confidence,
+            record.payload_json,
+        ),
+    )
+    conn.commit()
+    return int(cursor.lastrowid or 0)
+
+
+def _row_to_analysis(row: sqlite3.Row) -> AnalysisRecord:
+    created = row["created_at"]
+    return AnalysisRecord(
+        id=row["id"],
+        created_at=datetime.fromisoformat(created) if created else None,
+        repo_full_name=row["repo_full_name"],
+        issue_number=row["issue_number"],
+        model=row["model"],
+        confidence=row["confidence"],
+        payload_json=row["payload_json"],
+    )
+
+
+def latest_analysis(
+    conn: sqlite3.Connection,
+    repo_full_name: str,
+    issue_number: int,
+) -> AnalysisRecord | None:
+    """Return the most recent stored analysis for one issue, or None."""
+    row = conn.execute(
+        """
+        SELECT * FROM analyses
+        WHERE repo_full_name = ? AND issue_number = ?
+        ORDER BY id DESC LIMIT 1
+        """,
+        (repo_full_name, issue_number),
+    ).fetchone()
+    return _row_to_analysis(row) if row else None
+
+
+def list_analyses(
+    conn: sqlite3.Connection,
+    repo_full_name: str,
+    issue_number: int,
+) -> list[AnalysisRecord]:
+    """Return every stored analysis for one issue, oldest first."""
+    rows = conn.execute(
+        """
+        SELECT * FROM analyses
+        WHERE repo_full_name = ? AND issue_number = ?
+        ORDER BY id
+        """,
+        (repo_full_name, issue_number),
+    ).fetchall()
+    return [_row_to_analysis(row) for row in rows]

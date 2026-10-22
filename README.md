@@ -93,7 +93,23 @@ uv run forgeflow analyze pydantic/pydantic#1234
 uv run forgeflow implement pydantic/pydantic#1234 --plan "the approved plan"
 
 # Write a local review bundle under data/reports/.
+# Loads the stored analysis and the latest patch automatically.
 uv run forgeflow review pydantic/pydantic#1234
+```
+
+Manage cloned workspaces (clones are large and disposable):
+
+```bash
+uv run forgeflow workspace list
+uv run forgeflow workspace prune --keep 5 --dry-run
+uv run forgeflow workspace remove --issue pydantic/pydantic#1234
+```
+
+Emergency stop. Either of these halts all model calls and sandbox execution:
+
+```bash
+FORGEFLOW_KILL_SWITCH=1 uv run forgeflow analyze pydantic/pydantic#1234
+# or set kill_switch: true in config/repositories.yaml
 ```
 
 `implement --provider mock` uses the deterministic in-process agent, which needs

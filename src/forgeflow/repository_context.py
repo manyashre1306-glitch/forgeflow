@@ -605,3 +605,96 @@ def prepare_repo_context(
         max_file_bytes=max_file_bytes,
         max_total_bytes=max_total_bytes,
     )
+
+
+# --- workspace lifecycle ----------------------------------------------------
+
+
+def workspace_exists(root: Path | str, repo_full_name: str, issue_number: int) -> bool:
+    """Return whether a workspace directory exists for one issue."""
+    return workspace_path_for(root, repo_full_name, issue_number).is_dir()
+
+
+def remove_workspace(
+    root: Path | str,
+    repo_full_name: str,
+    issue_number: int,
+) -> bool:
+    """Delete one workspace. Returns whether anything was removed.
+
+    The path is rebuilt from ``workspace_path_for`` rather than taken from the
+    caller, so a crafted repository name cannot direct the delete somewhere else.
+    """
+    target = workspace_path_for(root, repo_full_name, issue_number)
+    if not target.is_dir():
+        return False
+    shutil.rmtree(target)
+    return True
+
+
+def list_workspaces(root: Path | str) -> list[Path]:
+    """Return the workspace directories under ``root``, sorted by name."""
+    base = Path(root)
+    if not base.is_dir():
+        return []
+    return sorted(entry for entry in base.iterdir() if entry.is_dir())
+
+
+def workspace_size_bytes(path: Path | str) -> int:
+    """Return the total size of a workspace tree, following no symlinks."""
+    base = Path(path)
+    if not base.is_dir():
+        return 0
+    total = 0
+    for entry in base.rglob("*"):
+        if entry.is_symlink() or not entry.is_file():
+            continue
+        try:
+            total += entry.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+def prune_workspaces(
+    root: Path | str,
+    *,
+    keep: int = 5,
+) -> list[Path]:
+    """Keep the ``keep`` most recently modified workspaces and delete the rest.
+
+    Clones are large and a full repository's history is not needed once its
+    context has been extracted, so this bounds disk use. The newest workspaces
+    are kept because those are the ones a current run is likely to still need.
+    Returns the paths that were removed.
+    """
+    if keep < 0:
+        raise ValueError("keep must not be negative")
+
+    entries = list_workspaces(root)
+    if keep == 0:
+        stale = entries
+    elif len(entries) <= keep:
+        return []
+    else:
+        ordered = sorted(entries, key=lambda path: path.stat().st_mtime, reverse=True)
+        stale = ordered[keep:]
+
+    removed: list[Path] = []
+    for path in stale:
+        shutil.rmtree(path)
+        removed.append(path)
+    return removed
+
+
+def cleanup_workspace(
+    root: Path | str,
+    repo_full_name: str,
+    issue_number: int,
+) -> bool:
+    """Alias for :func:`remove_workspace`, used after a run finishes.
+
+    Named separately because the call sites read differently: one is an explicit
+    operator action, the other is post-run tidying.
+    """
+    return remove_workspace(root, repo_full_name, issue_number)

@@ -21,7 +21,14 @@ from rich.table import Table
 from forgeflow import report as report_module
 from forgeflow import storage
 from forgeflow.agent_runner import AgentUnavailableError, get_agent
-from forgeflow.config import AppConfig, ConfigError, Settings, load_config
+from forgeflow.config import (
+    AppConfig,
+    ConfigError,
+    KillSwitchEngagedError,
+    Settings,
+    load_config,
+    require_kill_switch_clear,
+)
 from forgeflow.dedupe import DroppedIssue, deduplicate, filter_issues
 from forgeflow.discovery import DiscoveryResult, collect_linked_open_prs, discover_issues
 from forgeflow.github_client import GitHubClient, GitHubError, GitHubReader, MissingTokenError
@@ -34,7 +41,13 @@ from forgeflow.issue_analyzer import (
 from forgeflow.models import Issue, TaskState
 from forgeflow.pipeline import PipelineError, run_analysis, run_context, run_implement, run_review
 from forgeflow.ranking import rank_issues, resolve_weights, total_for
-from forgeflow.repository_context import RepositoryContextError
+from forgeflow.repository_context import (
+    RepositoryContextError,
+    list_workspaces,
+    prune_workspaces,
+    remove_workspace,
+    workspace_size_bytes,
+)
 from forgeflow.sandbox import IsolationError, build_sandbox
 
 DEFAULT_CONFIG_PATH = Path("config/repositories.yaml")
@@ -447,18 +460,25 @@ def analyze(
     skip_triage: Annotated[
         bool, typer.Option("--skip-triage", help="Analyse without the cheap triage call.")
     ] = False,
+    force: Annotated[
+        bool, typer.Option("--force", help="Re-analyse even if one is already stored.")
+    ] = False,
 ) -> None:
     """Analyse an issue with the configured models, then await plan approval."""
     repo_full_name, number = parse_issue_reference(issue)
     try:
         config = load_app_config(config_path)
+        require_kill_switch_clear(config)
         conn = open_db(db_path)
+    except KillSwitchEngagedError as exc:
+        console.print(f"[red]kill switch:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
     except ForgeFlowError as exc:
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
     try:
-        analyzer = build_analyzer(config.llm, conn=conn)
+        analyzer = build_analyzer(config.llm, conn=conn, app_config=config)
         outcome = run_analysis(
             conn,
             analyzer,
@@ -466,9 +486,13 @@ def analyze(
             number,
             workspace_root=workspace_root,
             skip_triage=skip_triage,
+            force=force,
         )
     except BudgetExceededError as exc:
         console.print(f"[red]budget:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    except KillSwitchEngagedError as exc:
+        console.print(f"[red]kill switch:[/red] {exc}")
         raise typer.Exit(code=1) from exc
     except ModelUnavailableError as exc:
         console.print(f"[red]model unavailable:[/red] {exc}")
@@ -523,6 +547,12 @@ def implement(
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
+    try:
+        require_kill_switch_clear()
+    except KillSwitchEngagedError as exc:
+        console.print(f"[red]kill switch:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
     sandbox = build_sandbox()
     if not sandbox.is_isolated:
         console.print("[yellow]warning:[/yellow] no container isolation available.")
@@ -541,6 +571,9 @@ def implement(
             plan,
             workspace_root=workspace_root,
         )
+    except KillSwitchEngagedError as exc:
+        console.print(f"[red]kill switch:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
     except (AgentUnavailableError, IsolationError, PipelineError, RepositoryContextError) as exc:
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
@@ -586,6 +619,77 @@ def review(
         console.print("  no patch recorded for this issue")
     else:
         console.print(f"  patch sha256: {outcome.patch.patch_sha256}")
+
+
+@app.command()
+def workspace(
+    action: Annotated[str, typer.Argument(help="One of: list, prune, remove.")] = "list",
+    issue: Annotated[
+        str | None,
+        typer.Option("--issue", help="Issue reference, required for remove."),
+    ] = None,
+    workspace_root: Annotated[Path, typer.Option("--workspace-root")] = Path("data/workspaces"),
+    keep: Annotated[int, typer.Option("--keep", help="How many workspaces prune should keep.")] = 5,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Show what would be removed, remove nothing.")
+    ] = False,
+) -> None:
+    """List, prune, or remove cloned workspaces under data/workspaces/.
+
+    Clones are large and disposable. Nothing here touches the database or any
+    remote, so it is always safe to run.
+    """
+    if action == "list":
+        entries = list_workspaces(workspace_root)
+        if not entries:
+            console.print(f"no workspaces under {workspace_root}")
+            return
+        table = Table(title=f"workspaces under {workspace_root}")
+        table.add_column("name")
+        table.add_column("size", justify="right")
+        for entry in entries:
+            size = workspace_size_bytes(entry)
+            table.add_row(entry.name, f"{size / 1024 / 1024:.1f} MiB")
+        console.print(table)
+        return
+
+    if action == "prune":
+        if dry_run:
+            entries = list_workspaces(workspace_root)
+            if len(entries) <= keep:
+                console.print(f"nothing to prune ({len(entries)} present, keeping {keep})")
+                return
+            ordered = sorted(entries, key=lambda path: path.stat().st_mtime, reverse=True)
+            for path in ordered[keep:]:
+                console.print(f"would remove {path}")
+            return
+        try:
+            removed = prune_workspaces(workspace_root, keep=keep)
+        except ValueError as exc:
+            console.print(f"[red]error:[/red] {exc}")
+            raise typer.Exit(code=1) from exc
+        if not removed:
+            console.print(f"nothing to prune (keeping {keep})")
+            return
+        console.print(f"removed {len(removed)} workspace(s), kept {keep}")
+        for path in removed:
+            console.print(f"  {path}")
+        return
+
+    if action == "remove":
+        if issue is None:
+            console.print("[red]error:[/red] --issue is required for remove")
+            raise typer.Exit(code=1)
+        repo_full_name, number = parse_issue_reference(issue)
+        removed = remove_workspace(workspace_root, repo_full_name, number)
+        if removed:
+            console.print(f"removed workspace for {repo_full_name}#{number}")
+        else:
+            console.print(f"no workspace found for {repo_full_name}#{number}")
+        return
+
+    console.print(f"[red]error:[/red] unknown action {action!r}; use list, prune, or remove")
+    raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":

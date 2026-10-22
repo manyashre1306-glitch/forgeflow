@@ -40,3 +40,26 @@ Conventions that must be preserved:
 - Patch approval binds to the SHA-256 of the exact diff bytes.
 - Gates after every step: `uv run python -m ruff check .`,
   `uv run python -m ruff format --check .`, `uv run python -m pytest -q`.
+
+## Phase 2 completion pass (2026-10-22)
+
+Four Phase 2 gaps were closed after the first pass, all in
+`tests/test_phase2_completion.py`:
+
+1. **Kill switch** (SPEC 9): `kill_switch: true` in the YAML or
+   `FORGEFLOW_KILL_SWITCH=1` in the environment. Checked before the budget check
+   and before the isolation check. Note: pydantic-settings maps the field to
+   `KILL_SWITCH` by default, so `validation_alias` is required for the
+   namespaced name to work. Do not remove it.
+2. **Analyses are persisted** in the `analyses` table as JSON. `run_review`
+   loads the latest when none is passed, so a standalone `review` is complete.
+   A stale payload returns None rather than raising.
+3. **Analyze idempotence**: re-analysing a task at or past
+   `awaiting_plan_approval` refuses unless `force=True`, and the refusal happens
+   before any model call.
+4. **Workspace lifecycle**: `list_workspaces`, `remove_workspace`,
+   `prune_workspaces`, and `forgeflow workspace list|prune|remove`. Removal
+   rebuilds the path internally, so a crafted repo name cannot escape the root.
+
+Current gate state: 508 tests pass, ruff check and format clean.
+

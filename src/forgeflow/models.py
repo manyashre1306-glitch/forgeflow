@@ -431,3 +431,23 @@ class PatchRecord(BaseModel):
     deletions: int = Field(default=0, ge=0)
     isolated: bool = True
     notes: str = ""
+
+
+class AnalysisRecord(BaseModel):
+    """A persisted analysis, so a review can be regenerated later.
+
+    The payload is stored as JSON text rather than as columns. The analysis
+    schema will evolve faster than a table should, and the report only needs to
+    read the whole object back, so normalising it would add migration work
+    without buying anything.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: int | None = None
+    created_at: datetime | None = None
+    repo_full_name: str
+    issue_number: int
+    model: str
+    confidence: float = Field(default=0.0, ge=0.0, le=1.0)
+    payload_json: str

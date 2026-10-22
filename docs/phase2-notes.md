@@ -253,3 +253,133 @@ Against a local fixture repository at `/tmp`, with no network:
 Both the `analyze` refusal and the `implement` warning are real output from this
 environment, not descriptions of intended behaviour.
 
+---
+
+## 9. Phase 2 completion pass (2026-10-22)
+
+Four gaps remained at the end of the first pass. All four are now closed and
+covered by tests. None was a new phase; each was something the SPEC asks for in
+Phase 2 scope that had been left undone.
+
+### 9.1 Kill switch (SPEC section 9)
+
+SPEC section 9 requires "a kill switch". There was none.
+
+Two independent sources, either one sufficient:
+
+- `kill_switch: true` in `config/repositories.yaml`
+- `FORGEFLOW_KILL_SWITCH=1` in the environment (the bare name `KILL_SWITCH` is
+  also honoured)
+
+The switch is checked **before** the budget check in the analyzer and **before**
+the isolation check in the sandbox, so it stops execution even when the budget
+would have allowed the call or the sandbox would have refused anyway. Verified
+on a real run:
+
+```
+$ FORGEFLOW_KILL_SWITCH=1 uv run forgeflow analyze "acme/widget#7" ...
+kill switch: kill switch engaged (FORGEFLOW_KILL_SWITCH is set in the
+environment); refusing to continue. Unset FORGEFLOW_KILL_SWITCH or set
+kill_switch: false in the configuration file to resume.
+exit=1
+```
+
+A genuine bug was found and fixed while wiring this up. pydantic-settings maps a
+field named `kill_switch` to the environment variable `KILL_SWITCH`, so the
+documented `FORGEFLOW_KILL_SWITCH` name silently did nothing:
+
+```
+$ FORGEFLOW_KILL_SWITCH=1 python -c "from forgeflow.config import Settings; print(Settings().kill_switch)"
+False          # before the fix: the documented variable had no effect
+```
+
+`validation_alias=AliasChoices("FORGEFLOW_KILL_SWITCH", "KILL_SWITCH")` fixes it.
+Both names now work and both are tested.
+
+### 9.2 Analyses are persisted (closes the known gap from section 7)
+
+Previously an analysis existed only in memory, so a standalone `forgeflow review`
+printed "No analysis was produced". Analyses now go into an `analyses` table as
+JSON payloads and `run_review` loads the latest one when none is passed.
+
+Why JSON rather than columns: the analysis schema will change faster than a table
+should, and the report only reads the object back whole. A payload that no longer
+validates returns `None` instead of raising, so a row written by an older schema
+cannot break a review run. Rows are append-only, so history is preserved.
+
+Verified: a standalone `review` (nothing passed in) now renders the problem,
+the fix proposal, the confidence, the triage verdict, and the risks.
+
+### 9.3 Analyze idempotence (SPEC section 10)
+
+SPEC section 10 requires idempotent operations. `run_analysis` would happily
+re-run and re-spend on an issue already at `awaiting_plan_approval`.
+
+It now refuses when an analysis exists and the task is at or past the approval
+gate, naming the `force=True` escape hatch. A test asserts the refusal happens
+**before** any model call, so the guard saves money rather than merely reporting
+afterwards. `--force` on the CLI replaces the stored analysis and leaves the task
+state unchanged.
+
+### 9.4 Workspace lifecycle (SPEC section 6)
+
+SPEC section 6 requires agent workspaces to stay out of version control. They
+were gitignored, but clones accumulated with no way to list or remove them.
+
+Added `list_workspaces`, `remove_workspace`, `workspace_size_bytes`,
+`prune_workspaces`, and a `forgeflow workspace list|prune|remove` command with
+`--dry-run`. `remove_workspace` rebuilds the path internally from
+`workspace_path_for` rather than trusting the caller, so a crafted repository
+name cannot direct the delete outside the workspace root; a test asserts a
+traversal-shaped name leaves an outside directory untouched.
+
+Verified with real commands:
+
+```
+$ uv run forgeflow workspace list --workspace-root /tmp/p2v/ws
+│ acme__widget__issue-7 │ 0.0 MiB │
+
+$ uv run forgeflow workspace prune --workspace-root /tmp/p2v/ws --keep 0 --dry-run
+would remove /tmp/p2v/ws/acme__widget__issue-7      # dry-run removed nothing
+
+$ uv run forgeflow workspace remove --workspace-root /tmp/p2v/ws --issue "acme/widget#7"
+removed workspace for acme/widget#7
+```
+
+### 9.5 `.env.example`
+
+It contained only `GITHUB_TOKEN=`. Now documents `GEMINI_API_KEY`,
+`JULES_API_KEY`, and `FORGEFLOW_KILL_SWITCH`, each with a note on what happens
+when it is absent. No real values, as required.
+
+### 9.6 Gate results after the completion pass
+
+```
+$ uv run python -m ruff check .
+All checks passed!
+
+$ uv run python -m ruff format --check .
+43 files already formatted
+
+$ uv run python -m pytest -q
+508 passed in 5.38s
+```
+
+Test count went from 469 to 508. The new file is
+`tests/test_phase2_completion.py` (39 tests) covering the kill switch from both
+sources, analysis persistence and stale-payload handling, idempotence, and the
+workspace lifecycle including the path-traversal case.
+
+### 9.7 Still not done, and why
+
+These remain out of scope for Phase 2 and are unchanged from section 6:
+
+- No real coding-agent run (no `JULES_API_KEY`), and no real model call (no
+  `GEMINI_API_KEY`).
+- No container execution (no daemon, no `podman`).
+- Validation, approval enforcement, and publishing are Phase 3 and Phase 4 work.
+
+The kill switch and idempotence guard are both verified by running the CLI, not
+only by unit tests. The two blocked items are blocked by absent credentials and
+an absent runtime, not by missing code.
+
