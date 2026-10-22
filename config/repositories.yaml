@@ -81,3 +81,24 @@ preferred_labels:
   - good first issue
   - help wanted
   - bug
+
+# Phase 2 model configuration. No secrets belong in this file; the API key is
+# read from GEMINI_API_KEY in the environment.
+#
+# Pricing is deliberately left at 0.0 rather than filled with guessed numbers.
+# A wrong constant would silently corrupt every cost figure, so set these from
+# the vendor's current published pricing before trusting any spend report.
+llm:
+  triage_model: gemini-2.5-flash
+  analysis_model: gemini-2.5-pro
+  monthly_cap_usd: 5.0
+  max_retries: 2
+  timeout_seconds: 60.0
+  max_output_tokens: 4096
+  pricing:
+    gemini-2.5-flash:
+      input_per_million: 0.0
+      output_per_million: 0.0
+    gemini-2.5-pro:
+      input_per_million: 0.0
+      output_per_million: 0.0
