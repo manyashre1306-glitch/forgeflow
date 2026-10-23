@@ -43,6 +43,7 @@ from forgeflow.models import (
     ApprovalAction,
     IllegalTransitionError,
     Issue,
+    PublishMode,
     TaskState,
 )
 from forgeflow.pipeline import (
@@ -53,6 +54,12 @@ from forgeflow.pipeline import (
     run_review,
     run_validation,
 )
+from forgeflow.publisher import (
+    GitHubWriteClient,
+    PublisherError,
+    plan_publish,
+)
+from forgeflow.publisher import publish as publish_patch
 from forgeflow.ranking import rank_issues, resolve_weights, total_for
 from forgeflow.repository_context import (
     RepositoryContextError,
@@ -1103,6 +1110,116 @@ def validation_exception(
     console.print(f"  authorized:   {actor}")
     console.print(f"  reason:       {reason}")
     console.print("note: this exception is bound to that exact patch hash.")
+
+
+def build_write_client() -> GitHubWriteClient:
+    """Construct the publishing client. The token is read inside the client.
+
+    This function never reads the token itself, so the CLI process can report a
+    missing credential without holding one.
+    """
+    return GitHubWriteClient()
+
+
+@app.command()
+def publish(
+    issue: Annotated[str, typer.Argument(help="Issue reference, e.g. owner/repo#123.")],
+    db_path: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
+    config_path: Annotated[Path, typer.Option("--config")] = DEFAULT_CONFIG_PATH,
+    target_branch: Annotated[
+        str, typer.Option("--target-branch", help="Branch the draft PR would target.")
+    ] = "main",
+    confirm_real_publish: Annotated[
+        bool,
+        typer.Option(
+            "--confirm-real-publish",
+            help="Actually create the draft PR. Without this flag the run is a dry run.",
+        ),
+    ] = False,
+    actor: Annotated[str, typer.Option("--actor")] = "operator",
+) -> None:
+    """Publish the approved patch as a DRAFT PR, or show what would be written.
+
+    Dry-run is the default: without --confirm-real-publish nothing is sent to
+    GitHub. A real write needs a valid approval for this exact patch, a task at
+    awaiting_publish_approval, and a repository on the allowlist.
+    """
+    repo_full_name, number = parse_issue_reference(issue)
+    try:
+        config = load_app_config(config_path)
+        conn = open_db(db_path)
+        require_kill_switch_clear(config, None, conn)
+    except KillSwitchEngagedError as exc:
+        console.print(f"[red]kill switch:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    except ForgeFlowError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    mode = PublishMode.REAL if confirm_real_publish else PublishMode.DRY_RUN
+    client = None
+    try:
+        if mode is PublishMode.REAL:
+            client = build_write_client()
+        plan = plan_publish(
+            conn,
+            repo_full_name,
+            number,
+            target_branch=target_branch,
+            mode=mode,
+            client=client,
+            actor=actor,
+        )
+    except PublisherError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    console.print(plan.render())
+
+    if plan.refused:
+        console.print(f"\n[red]refused:[/red] {plan.refusal_reason}")
+        raise typer.Exit(code=1)
+
+    if mode is PublishMode.DRY_RUN:
+        console.print(
+            "\n[yellow]dry run:[/yellow] nothing was written. Re-run with "
+            "--confirm-real-publish to open the draft PR."
+        )
+        try:
+            publish_patch(
+                conn,
+                repo_full_name,
+                number,
+                target_branch=target_branch,
+                mode=PublishMode.DRY_RUN,
+                actor=actor,
+            )
+        except PublisherError as exc:
+            console.print(f"[red]error:[/red] {exc}")
+            raise typer.Exit(code=1) from exc
+        finally:
+            conn.close()
+        return
+
+    try:
+        record = publish_patch(
+            conn,
+            repo_full_name,
+            number,
+            target_branch=target_branch,
+            mode=PublishMode.REAL,
+            client=client,
+            actor=actor,
+        )
+    except PublisherError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    finally:
+        conn.close()
+        if client is not None:
+            client.close()
+
+    console.print(f"[green]draft PR created:[/green] {record.pr_url}")
 
 
 if __name__ == "__main__":

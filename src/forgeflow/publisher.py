@@ -29,7 +29,7 @@ from forgeflow.models import (
     TaskState,
 )
 from forgeflow.patch import compute_patch_sha256
-from forgeflow.publish_token import PublishTokenError, publish_token_present, read_publish_token
+from forgeflow.publish_token import read_publish_token
 
 
 def _safe_message(response: object) -> str:
@@ -85,9 +85,14 @@ class PublishPlan:
     body: str
     draft: bool = True
     mode: PublishMode = PublishMode.DRY_RUN
-    checks: list[tuple[str, bool, str]] = field(default_factory=list)
+    # (name, status, detail) where status is PASS, FAIL, or UNVERIFIED. The
+    # third value matters: a dry run with no client cannot confirm the target
+    # branch or the token scope, and showing those as PASS would tell a human
+    # reviewer something ForgeFlow does not know.
+    checks: list[tuple[str, str, str]] = field(default_factory=list)
     refused: bool = False
     refusal_reason: str = ""
+    unverified: list[str] = field(default_factory=list)
 
     @property
     def allowed(self) -> bool:
@@ -107,9 +112,14 @@ class PublishPlan:
             "",
             "checks:",
         ]
-        for name, ok, detail in self.checks:
-            mark = "PASS" if ok else "FAIL"
-            lines.append(f"  [{mark}] {name}: {detail}")
+        for name, status, detail in self.checks:
+            lines.append(f"  [{status}] {name}: {detail}")
+        if self.unverified:
+            lines.append("")
+            lines.append(
+                "WARNING: these checks could not be verified in this run and are "
+                f"NOT a pass: {', '.join(self.unverified)}"
+            )
         if self.refused:
             lines.append("")
             lines.append(f"REFUSED: {self.refusal_reason}")
@@ -222,6 +232,30 @@ def plan_publish(
     order and recorded on the plan, so a refusal names the exact check that
     failed. ``mode`` only labels the plan; the caller decides whether to act.
     """
+    # Check 1, first: the repository must be on the hard-coded allowlist. This
+    # runs before any database lookup so a third-party target is refused before
+    # ForgeFlow does any work at all.
+    if not is_repo_allowed(repo_full_name):
+        plan = PublishPlan(
+            repo_full_name=repo_full_name,
+            issue_number=issue_number,
+            patch_sha256="",
+            target_branch=target_branch,
+            head_branch="",
+            title="",
+            body="",
+            mode=mode,
+        )
+        plan.checks.append(
+            ("allowlist", "FAIL", f"{repo_full_name} is NOT on the publish allowlist")
+        )
+        plan.refused = True
+        plan.refusal_reason = (
+            f"{repo_full_name} is not on the publish allowlist. ForgeFlow only writes "
+            f"to repositories listed in PUBLISH_ALLOWLIST. Adding one is a code change."
+        )
+        return plan
+
     issue = storage.get_issue(conn, repo_full_name, issue_number)
     if issue is None:
         raise PublisherError(f"{repo_full_name}#{issue_number} is not in the database")
@@ -231,6 +265,13 @@ def plan_publish(
         raise PublisherError(
             f"no patch recorded for {repo_full_name}#{issue_number}; nothing to publish"
         )
+
+    # Idempotence is checked early, before the task-state check, because a retry
+    # of an already-published patch is a duplicate no matter what state the task
+    # moved to afterwards. Reporting it as a state error would mislead.
+    existing_publication = storage.find_publication_for_patch(
+        conn, repo_full_name, issue_number, patch.patch_sha256
+    )
 
     head_branch = head_branch_for(issue_number, patch.patch_sha256)
     title = f"{issue.title[:60]}" if issue.title else f"Fix #{issue_number}"
@@ -247,21 +288,29 @@ def plan_publish(
     )
 
     def check(name: str, ok: bool, detail: str) -> bool:
-        plan.checks.append((name, ok, detail))
+        plan.checks.append((name, "PASS" if ok else "FAIL", detail))
         return ok
 
-    # Check 1: the repository is on the hard-coded allowlist.
+    def unverified(name: str, detail: str) -> None:
+        plan.checks.append((name, "UNVERIFIED", detail))
+        plan.unverified.append(name)
+
+    check("allowlist", True, f"{repo_full_name} is on the publish allowlist")
+
+    # Idempotence, before any state or approval check. Publishing the same patch
+    # twice must be reported as a duplicate rather than as a stale-state error,
+    # because after a successful publish the task has legitimately moved on.
     if not check(
-        "allowlist",
-        is_repo_allowed(repo_full_name),
-        f"{repo_full_name} is "
-        f"{'allowed' if is_repo_allowed(repo_full_name) else 'NOT on the publish allowlist'}",
+        "idempotence",
+        existing_publication is None,
+        f"already published as {existing_publication.pr_url}"
+        if existing_publication
+        else "no prior publication",
     ):
         plan.refused = True
         plan.refusal_reason = (
-            f"{repo_full_name} is not on the publish allowlist. ForgeFlow only "
-            f"writes to repositories listed in PUBLISH_ALLOWLIST. Adding one is a "
-            f"code change."
+            f"this exact patch was already published as {existing_publication.pr_url}. "
+            "Publishing again would create a duplicate PR."
         )
         return plan
 
@@ -345,24 +394,8 @@ def plan_publish(
             )
             return plan
     else:
-        check("target branch", True, f"{target_branch} (not verified: no client)")
-        check("permission scope", True, "not verified: no client")
-
-    # Idempotence: the same patch must not be published twice.
-    existing = storage.find_publication_for_patch(
-        conn, repo_full_name, issue_number, patch.patch_sha256
-    )
-    if not check(
-        "idempotence",
-        existing is None,
-        f"already published as {existing.pr_url}" if existing else "no prior publication",
-    ):
-        plan.refused = True
-        plan.refusal_reason = (
-            f"this exact patch was already published as {existing.pr_url}. "
-            "Publishing again would create a duplicate PR."
-        )
-        return plan
+        unverified("target branch", f"{target_branch} could not be checked (dry run, no client)")
+        unverified("permission scope", "token scope could not be checked (dry run, no client)")
 
     plan.body = build_pr_body(
         repo_full_name=repo_full_name,
@@ -446,9 +479,6 @@ def publish(
     # Real write from here on.
     if client is None:
         raise PublisherError("a real publish requires a GitHub write client; none was supplied")
-
-    if not publish_token_present():
-        raise PublishTokenError("FORGEFLOW_PUBLISH_TOKEN is not set; a real publish cannot proceed")
 
     result = client.create_draft_pull_request(
         repo_full_name=repo_full_name,

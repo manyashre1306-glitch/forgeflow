@@ -78,7 +78,18 @@ LEGAL_TRANSITIONS: dict[TaskState, frozenset[TaskState]] = {
             TaskState.IMPLEMENTING,
         }
     ),
-    TaskState.PUBLISHED: frozenset({TaskState.MERGED, TaskState.CLOSED}),
+    TaskState.PUBLISHED: frozenset(
+        {
+            TaskState.MERGED,
+            TaskState.CLOSED,
+            # A maintainer can request changes on an open PR, which sends the
+            # task back to implementation. SPEC 11 measures the substantive
+            # revision rate, so this path must exist; without it a review
+            # requesting changes has nowhere to go. Re-publishing still needs
+            # fresh validation and a fresh approval, so this adds no write risk.
+            TaskState.IMPLEMENTING,
+        }
+    ),
     TaskState.MERGED: frozenset(),
     TaskState.CLOSED: frozenset(),
     TaskState.DISCARDED: frozenset(),
@@ -456,7 +467,10 @@ class PublicationRecord(BaseModel):
     created_at: datetime | None = None
     repo_full_name: str
     issue_number: int
-    patch_sha256: str = Field(min_length=64, max_length=64)
+    # Empty only when a publish was refused before the patch was examined, such
+    # as a third-party repository. A real publication always carries the full
+    # hash, and the idempotence query ignores empty-hash rows.
+    patch_sha256: str = Field(default="", max_length=64)
     target_branch: str = ""
     head_branch: str = ""
     mode: PublishMode = PublishMode.DRY_RUN

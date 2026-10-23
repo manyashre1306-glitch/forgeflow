@@ -93,17 +93,43 @@ def redact(text: str, *, extra_secrets: tuple[str, ...] = ()) -> str:
     return result
 
 
-def _redact_unless_hex(match: re.Match[str]) -> str:
-    """Redact a candidate, unless it is a plain hex digest.
+_URL_SCHEME = re.compile(r"(?i)^(?:https?|git|ssh)://")
 
-    Called for each entropy candidate. A 40- or 64-character hex string is
-    almost always a git object id or a content hash, both of which are useful
-    evidence and neither of which is a credential.
+
+def _redact_unless_hex(match: re.Match[str]) -> str:
+    """Redact an entropy candidate, with two deliberate exceptions.
+
+    * A 40- or 64-character hex string is a git object id or a content hash, not
+      a credential. Redacting it would destroy the audit trail that binds an
+      approval to an exact patch.
+    * A candidate that is the host-and-path part of a URL is kept. Without this,
+      ``github.com/owner/repo/pull/42`` collapses to ``github.[REDACTED]`` and
+      SPEC 10's requirement to track PR URLs cannot be met.
+
+    The URL exception is deliberately narrow: the candidate must contain ``/``
+    and the whitespace-delimited token it belongs to must begin with a URL
+    scheme. A credential in a query string is its own token, so it is still
+    redacted. An earlier version of this function exempted any long run
+    containing ``/``, which was too broad; this checks context instead.
     """
     value = match.group(0)
     if len(value) in (40, 64) and _PURE_HEX.match(value):
         return value
+    if _is_url_path(match):
+        return value
     return REDACTED
+
+
+def _is_url_path(match: re.Match[str]) -> bool:
+    """Whether a candidate is the host-and-path part of a URL."""
+    if "/" not in match.group(0):
+        return False
+    text = match.string
+    start = match.start()
+    token_start = start
+    while token_start > 0 and not text[token_start - 1].isspace():
+        token_start -= 1
+    return bool(_URL_SCHEME.match(text[token_start:start]))
 
 
 def environment_secrets() -> tuple[str, ...]:
