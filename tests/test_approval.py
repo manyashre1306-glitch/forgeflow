@@ -79,6 +79,34 @@ def seed(conn, state: TaskState = TaskState.VALIDATING, diff: str = DIFF) -> Pat
     return patch
 
 
+def store_passing_validation(conn, patch_sha256: str, number: int = 7) -> None:
+    """Record one passing check, which the approval gate requires.
+
+    Approval is gated on execution evidence (SPEC 7), so a test that approves
+    must first establish that a check ran and passed for the patch.
+    """
+    from forgeflow.models import CheckKind, CheckStatus, ValidationCheck, ValidationReport
+
+    storage.record_validation_report(
+        conn,
+        ValidationReport(
+            repo_full_name=REPO,
+            issue_number=number,
+            patch_sha256=patch_sha256,
+            isolated=True,
+            checks=[
+                ValidationCheck(
+                    kind=CheckKind.TESTS,
+                    name="pytest",
+                    command=["python", "-m", "pytest"],
+                    status=CheckStatus.PASSED,
+                    exit_code=0,
+                )
+            ],
+        ),
+    )
+
+
 # --------------------------------------------------------------------------
 # The core guarantee: approval is bound to the exact patch
 # --------------------------------------------------------------------------
@@ -315,6 +343,7 @@ def test_at_most_one_live_decision(conn) -> None:
 
 def test_approve_moves_to_awaiting_publish_approval(conn) -> None:
     seed(conn, state=TaskState.VALIDATING)
+    store_passing_validation(conn, compute_patch_sha256(DIFF))
     _, state = approval.apply_action(conn, REPO, 7, ApprovalAction.APPROVE)
     assert state is TaskState.AWAITING_PUBLISH_APPROVAL
 

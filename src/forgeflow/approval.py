@@ -31,6 +31,7 @@ from forgeflow.models import (
     ApprovalAction,
     ApprovalRecord,
     TaskState,
+    validate_transition,
 )
 from forgeflow.patch import compute_patch_sha256
 
@@ -288,6 +289,54 @@ _ACTION_TARGET: dict[ApprovalAction, TaskState] = {
 }
 
 
+def require_validation_or_exception(
+    conn: sqlite3.Connection,
+    repo_full_name: str,
+    issue_number: int,
+    *,
+    patch_sha256: str,
+) -> tuple[bool, str]:
+    """Whether a task may advance to awaiting_publish_approval.
+
+    Returns ``(ok, reason)``. Passing requires one of two things:
+
+    * a recorded check that actually executed and exited zero for this exact
+      patch (``validation_passed_for_patch``), or
+    * a documented exception bound to this exact patch.
+
+    Everything else refuses, including the case that matters most: a report
+    whose checks were all skipped, which is the state this environment is in
+    when no container runtime is available. Skipped is not passed.
+    """
+    if storage.validation_passed_for_patch(conn, repo_full_name, issue_number, patch_sha256):
+        return True, ""
+
+    exception = storage.validation_exception_for_patch(
+        conn, repo_full_name, issue_number, patch_sha256
+    )
+    if exception is not None:
+        return True, f"authorized by exception from {exception['authorized_by']}"
+
+    rows = storage.list_validation_results(
+        conn, repo_full_name, issue_number, patch_sha256=patch_sha256
+    )
+    if not rows:
+        return False, ("no validation has been run for this patch; run 'forgeflow validate' first")
+
+    if storage.validation_failed_for_patch(conn, repo_full_name, issue_number, patch_sha256):
+        return False, (
+            "validation failed for this patch; fix it and re-validate, or record "
+            "an exception with 'forgeflow validation-exception'"
+        )
+
+    return False, (
+        "validation recorded no executed checks for this patch (all checks were "
+        "skipped, usually because no container isolation was available); an "
+        "unverified patch cannot be approved for publishing. Record an exception "
+        "with 'forgeflow validation-exception' if you have verified it another way"
+    )
+
+
 def apply_action(
     conn: sqlite3.Connection,
     repo_full_name: str,
@@ -312,6 +361,25 @@ def apply_action(
             "run 'forgeflow implement' first"
         )
 
+    issue = storage.get_issue(conn, repo_full_name, issue_number)
+    if issue is None:
+        raise ApprovalError(f"{repo_full_name}#{issue_number} is not in the database")
+
+    target = _ACTION_TARGET[action]
+
+    # Refuse before writing anything. Recording the decision first would leave
+    # an approval on record even when the transition is rejected, which would
+    # make the audit trail claim a decision that never took effect.
+    if issue.task_state is not target:
+        validate_transition(issue.task_state, target)
+
+    if action is ApprovalAction.APPROVE:
+        ok, why = require_validation_or_exception(
+            conn, repo_full_name, issue_number, patch_sha256=patch.patch_sha256
+        )
+        if not ok:
+            raise ApprovalError(f"refusing to approve {repo_full_name}#{issue_number}: {why}")
+
     decision = record_decision(
         conn,
         repo_full_name,
@@ -322,11 +390,6 @@ def apply_action(
         actor=actor,
         reason=reason,
     )
-
-    target = _ACTION_TARGET[action]
-    issue = storage.get_issue(conn, repo_full_name, issue_number)
-    if issue is None:
-        raise ApprovalError(f"{repo_full_name}#{issue_number} is not in the database")
 
     if issue.task_state is target:
         return decision, issue.task_state
