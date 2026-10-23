@@ -17,7 +17,6 @@ from forgeflow.models import (
     ApprovalAction,
     CheckKind,
     CheckStatus,
-    IllegalTransitionError,
     Issue,
     PatchRecord,
     Repository,
@@ -234,23 +233,41 @@ def test_discard_is_not_gated(conn) -> None:
     assert state is TaskState.DISCARDED
 
 
-def test_illegal_transition_still_refused(conn) -> None:
-    """The ordering fix must not weaken the state machine.
-
-    From failed_validation the legal moves are implementing and discarded, so
-    approve is refused by the state machine before the validation gate is even
-    consulted.
-    """
+def test_failed_state_cannot_be_approved_without_an_exception(conn) -> None:
+    """failed_validation may reach publishing only via a documented exception."""
     storage.transition_task_state(conn, REPO, 7, TaskState.FAILED_VALIDATION)
-    with pytest.raises(IllegalTransitionError, match="illegal transition"):
+    with pytest.raises(ApprovalError, match="validation failed"):
         approval.apply_action(conn, REPO, 7, ApprovalAction.APPROVE)
 
 
-def test_illegal_transition_leaves_no_approval_row(conn) -> None:
+def test_failed_state_approval_leaves_no_approval_row(conn) -> None:
     storage.transition_task_state(conn, REPO, 7, TaskState.FAILED_VALIDATION)
-    with pytest.raises(IllegalTransitionError):
+    with pytest.raises(ApprovalError):
         approval.apply_action(conn, REPO, 7, ApprovalAction.APPROVE)
     assert approval.live_approval(conn, REPO, 7) is None
+
+
+def test_stale_pass_does_not_override_a_later_failure(conn) -> None:
+    """A pass recorded earlier must not authorize a patch that later failed.
+
+    The patch is unchanged, so validation_passed_for_patch still returns True
+    from the earlier run. From failed_validation the gate must demand an
+    exception instead, otherwise a failure could be papered over by old
+    evidence.
+    """
+    store(conn, [CheckStatus.PASSED])
+    storage.transition_task_state(conn, REPO, 7, TaskState.FAILED_VALIDATION)
+    with pytest.raises(ApprovalError, match="validation failed"):
+        approval.apply_action(conn, REPO, 7, ApprovalAction.APPROVE)
+
+
+def test_exception_does_authorize_approval_from_failed_state(conn) -> None:
+    storage.transition_task_state(conn, REPO, 7, TaskState.FAILED_VALIDATION)
+    storage.record_validation_exception(
+        conn, REPO, 7, patch_sha256=HASH, authorized_by="manyashre", reason="verified by hand"
+    )
+    _, state = approval.apply_action(conn, REPO, 7, ApprovalAction.APPROVE)
+    assert state is TaskState.AWAITING_PUBLISH_APPROVAL
 
 
 # --------------------------------------------------------------------------
@@ -317,7 +334,7 @@ def test_failed_validation_recorded_by_pipeline_blocks_approval(conn) -> None:
         validator=Validator(sandbox),
         commands=ValidationCommands(tests=["python", "-m", "pytest"]),
     )
-    # The pipeline moved the task to failed_validation, so approving is now an
-    # illegal transition as well as unproven.
-    with pytest.raises(IllegalTransitionError):
+    # The pipeline moved the task to failed_validation. Approving from there is
+    # legal only with a recorded exception, so the gate refuses.
+    with pytest.raises(ApprovalError, match="validation failed"):
         approval.apply_action(conn, REPO, 7, ApprovalAction.APPROVE)

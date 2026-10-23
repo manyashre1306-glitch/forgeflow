@@ -295,6 +295,7 @@ def require_validation_or_exception(
     issue_number: int,
     *,
     patch_sha256: str,
+    from_failed_state: bool = False,
 ) -> tuple[bool, str]:
     """Whether a task may advance to awaiting_publish_approval.
 
@@ -308,7 +309,9 @@ def require_validation_or_exception(
     whose checks were all skipped, which is the state this environment is in
     when no container runtime is available. Skipped is not passed.
     """
-    if storage.validation_passed_for_patch(conn, repo_full_name, issue_number, patch_sha256):
+    if not from_failed_state and storage.validation_passed_for_patch(
+        conn, repo_full_name, issue_number, patch_sha256
+    ):
         return True, ""
 
     exception = storage.validation_exception_for_patch(
@@ -317,17 +320,22 @@ def require_validation_or_exception(
     if exception is not None:
         return True, f"authorized by exception from {exception['authorized_by']}"
 
+    # The failed state is itself evidence of a failure, so report that even when
+    # no rows were kept. Checked before the empty case so the reason names the
+    # real problem rather than claiming validation never ran.
+    if from_failed_state or storage.validation_failed_for_patch(
+        conn, repo_full_name, issue_number, patch_sha256
+    ):
+        return False, (
+            "validation failed for this patch; fix it and re-validate, or record "
+            "an exception with 'forgeflow validation-exception'"
+        )
+
     rows = storage.list_validation_results(
         conn, repo_full_name, issue_number, patch_sha256=patch_sha256
     )
     if not rows:
         return False, ("no validation has been run for this patch; run 'forgeflow validate' first")
-
-    if storage.validation_failed_for_patch(conn, repo_full_name, issue_number, patch_sha256):
-        return False, (
-            "validation failed for this patch; fix it and re-validate, or record "
-            "an exception with 'forgeflow validation-exception'"
-        )
 
     return False, (
         "validation recorded no executed checks for this patch (all checks were "
@@ -375,7 +383,11 @@ def apply_action(
 
     if action is ApprovalAction.APPROVE:
         ok, why = require_validation_or_exception(
-            conn, repo_full_name, issue_number, patch_sha256=patch.patch_sha256
+            conn,
+            repo_full_name,
+            issue_number,
+            patch_sha256=patch.patch_sha256,
+            from_failed_state=issue.task_state is TaskState.FAILED_VALIDATION,
         )
         if not ok:
             raise ApprovalError(f"refusing to approve {repo_full_name}#{issue_number}: {why}")

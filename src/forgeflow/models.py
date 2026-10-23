@@ -60,7 +60,16 @@ LEGAL_TRANSITIONS: dict[TaskState, frozenset[TaskState]] = {
             TaskState.DISCARDED,
         }
     ),
-    TaskState.FAILED_VALIDATION: frozenset({TaskState.IMPLEMENTING, TaskState.DISCARDED}),
+    TaskState.FAILED_VALIDATION: frozenset(
+        {
+            TaskState.IMPLEMENTING,
+            TaskState.DISCARDED,
+            # Reachable only when the approval gate finds a recorded exception: a
+            # failed check is overridable by explicit review (SPEC 7), and without
+            # this edge a documented exception could be recorded but never used.
+            TaskState.AWAITING_PUBLISH_APPROVAL,
+        }
+    ),
     TaskState.AWAITING_PUBLISH_APPROVAL: frozenset(
         {
             TaskState.PUBLISHED,
