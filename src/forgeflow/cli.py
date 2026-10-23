@@ -1035,5 +1035,75 @@ def validate(
     raise typer.Exit(code=1)
 
 
+@app.command("validation-exception")
+def validation_exception(
+    issue: Annotated[str, typer.Argument(help="Issue reference, e.g. owner/repo#123.")],
+    db_path: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
+    config_path: Annotated[Path, typer.Option("--config")] = DEFAULT_CONFIG_PATH,
+    actor: Annotated[
+        str, typer.Option("--actor", help="Who authorizes the exception.")
+    ] = "operator",
+    reason: Annotated[str, typer.Option("--reason", help="Why the failure is acceptable.")] = "",
+) -> None:
+    """Record a documented exception that authorizes publishing past a failure.
+
+    SPEC section 7 allows a failed check to be overridden only by an explicit,
+    documented review. The exception is bound to the exact patch hash, so a new
+    patch needs a new exception. It writes an audit event, because the whole
+    point is that the override is recorded rather than silent.
+    """
+    if not reason.strip():
+        console.print("[red]error:[/red] --reason is required; an exception must be documented")
+        raise typer.Exit(code=1)
+
+    repo_full_name, number = parse_issue_reference(issue)
+    try:
+        config = load_app_config(config_path)
+        conn = open_db(db_path)
+        require_kill_switch_clear(config, None, conn)
+    except KillSwitchEngagedError as exc:
+        console.print(f"[red]kill switch:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    except ForgeFlowError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    try:
+        patch = storage.latest_patch(conn, repo_full_name, number)
+        if patch is None:
+            console.print(
+                f"[red]error:[/red] no patch recorded for {repo_full_name}#{number}; "
+                "run 'forgeflow implement' first"
+            )
+            raise typer.Exit(code=1)
+
+        storage.record_validation_exception(
+            conn,
+            repo_full_name,
+            number,
+            patch_sha256=patch.patch_sha256,
+            authorized_by=actor,
+            reason=reason,
+        )
+        audit.record(
+            conn,
+            "validation.exception_recorded",
+            repo_full_name=repo_full_name,
+            issue_number=number,
+            severity="warning",
+            actor=actor,
+            detail=reason,
+            payload={"patch_sha256": patch.patch_sha256},
+        )
+    finally:
+        conn.close()
+
+    console.print(f"validation-exception: {repo_full_name}#{number}")
+    console.print(f"  patch sha256: {patch.patch_sha256}")
+    console.print(f"  authorized:   {actor}")
+    console.print(f"  reason:       {reason}")
+    console.print("note: this exception is bound to that exact patch hash.")
+
+
 if __name__ == "__main__":
     app()
