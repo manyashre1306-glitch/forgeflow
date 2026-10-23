@@ -22,6 +22,7 @@ from forgeflow.models import (
     IssueScore,
     LLMUsage,
     PatchRecord,
+    PublicationRecord,
     Repository,
     TaskState,
     ValidationReport,
@@ -119,6 +120,30 @@ CREATE TABLE IF NOT EXISTS analyses (
     FOREIGN KEY (repo_full_name, issue_number)
         REFERENCES issues(repo_full_name, number)
 );
+
+CREATE TABLE IF NOT EXISTS publications (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at      TEXT NOT NULL,
+    repo_full_name  TEXT NOT NULL,
+    issue_number    INTEGER NOT NULL,
+    patch_sha256    TEXT NOT NULL,
+    target_branch   TEXT NOT NULL DEFAULT '',
+    head_branch     TEXT NOT NULL DEFAULT '',
+    mode            TEXT NOT NULL,
+    published       INTEGER NOT NULL DEFAULT 0,
+    draft           INTEGER NOT NULL DEFAULT 1,
+    pr_number       INTEGER,
+    pr_url          TEXT NOT NULL DEFAULT '',
+    title           TEXT NOT NULL DEFAULT '',
+    body            TEXT NOT NULL DEFAULT '',
+    refusal_reason  TEXT NOT NULL DEFAULT '',
+    actor           TEXT NOT NULL DEFAULT 'operator',
+    FOREIGN KEY (repo_full_name, issue_number)
+        REFERENCES issues(repo_full_name, number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_publications_patch
+    ON publications (repo_full_name, issue_number, patch_sha256);
 
 CREATE TABLE IF NOT EXISTS validation_results (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -758,6 +783,108 @@ def record_analysis(conn: sqlite3.Connection, record: AnalysisRecord) -> int:
     )
     conn.commit()
     return int(cursor.lastrowid or 0)
+
+
+def record_publication(conn: sqlite3.Connection, record: PublicationRecord) -> int:
+    """Insert one publish attempt and return its row id.
+
+    Dry runs are recorded as well as real publishes, so the log shows what was
+    proposed even when nothing was written.
+    """
+    from forgeflow.security import redact
+
+    cursor = conn.execute(
+        """
+        INSERT INTO publications (
+            created_at, repo_full_name, issue_number, patch_sha256, target_branch,
+            head_branch, mode, published, draft, pr_number, pr_url, title, body,
+            refusal_reason, actor
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            (record.created_at or datetime.now(UTC)).isoformat(),
+            record.repo_full_name,
+            record.issue_number,
+            record.patch_sha256,
+            record.target_branch,
+            record.head_branch,
+            record.mode.value,
+            1 if record.published else 0,
+            1 if record.draft else 0,
+            record.pr_number,
+            record.pr_url,
+            redact(record.title),
+            redact(record.body),
+            redact(record.refusal_reason),
+            record.actor,
+        ),
+    )
+    conn.commit()
+    return int(cursor.lastrowid or 0)
+
+
+def find_publication_for_patch(
+    conn: sqlite3.Connection,
+    repo_full_name: str,
+    issue_number: int,
+    patch_sha256: str,
+) -> PublicationRecord | None:
+    """Return a successful real publication of this exact patch, or None.
+
+    This is the idempotence query: a patch that already has a published PR must
+    not produce a second one. Dry runs are excluded, because a dry run created
+    nothing to duplicate.
+    """
+    row = conn.execute(
+        """
+        SELECT * FROM publications
+        WHERE repo_full_name = ? AND issue_number = ? AND patch_sha256 = ?
+          AND published = 1 AND pr_url != ''
+        ORDER BY id DESC LIMIT 1
+        """,
+        (repo_full_name, issue_number, patch_sha256),
+    ).fetchone()
+    if row is None:
+        return None
+    return _row_to_publication(row)
+
+
+def list_publications(
+    conn: sqlite3.Connection,
+    repo_full_name: str,
+    issue_number: int,
+) -> list[PublicationRecord]:
+    """Every publish attempt for a task, oldest first."""
+    rows = conn.execute(
+        """
+        SELECT * FROM publications
+        WHERE repo_full_name = ? AND issue_number = ?
+        ORDER BY id
+        """,
+        (repo_full_name, issue_number),
+    ).fetchall()
+    return [_row_to_publication(row) for row in rows]
+
+
+def _row_to_publication(row: sqlite3.Row) -> PublicationRecord:
+    return PublicationRecord(
+        id=row["id"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+        repo_full_name=row["repo_full_name"],
+        issue_number=row["issue_number"],
+        patch_sha256=row["patch_sha256"],
+        target_branch=row["target_branch"],
+        head_branch=row["head_branch"],
+        mode=row["mode"],
+        published=bool(row["published"]),
+        draft=bool(row["draft"]),
+        pr_number=row["pr_number"],
+        pr_url=row["pr_url"],
+        title=row["title"],
+        body=row["body"],
+        refusal_reason=row["refusal_reason"],
+        actor=row["actor"],
+    )
 
 
 def record_validation_report(

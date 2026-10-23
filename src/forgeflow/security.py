@@ -29,6 +29,9 @@ SECRET_ENV_VARS = (
     "OPENAI_API_KEY",
     "ANTHROPIC_API_KEY",
     "FORGEFLOW_TOKEN",
+    # The publishing credential (SPEC 8). Listed here so it is scrubbed from any
+    # captured output even though only publisher.py ever reads it.
+    "FORGEFLOW_PUBLISH_TOKEN",
 )
 
 # Token shapes, most specific first. Each entry is (name, compiled pattern).

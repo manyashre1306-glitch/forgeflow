@@ -432,6 +432,45 @@ def compute_cost_usd(
     return round(cost, 6)
 
 
+class PublishMode(StrEnum):
+    """Whether a publish run may write to GitHub (SPEC section 8).
+
+    Dry-run is the default everywhere. A real write needs an explicit flag, a
+    valid approval, and a repository on the allowlist.
+    """
+
+    DRY_RUN = "dry_run"
+    REAL = "real"
+
+
+class PublicationRecord(BaseModel):
+    """One publish attempt and its outcome (SPEC sections 8 and 10).
+
+    Recorded for dry runs too, so the log shows what would have been written.
+    ``pr_number`` is None until a real PR is created, and is never invented.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: int | None = None
+    created_at: datetime | None = None
+    repo_full_name: str
+    issue_number: int
+    patch_sha256: str = Field(min_length=64, max_length=64)
+    target_branch: str = ""
+    head_branch: str = ""
+    mode: PublishMode = PublishMode.DRY_RUN
+    published: bool = False
+    draft: bool = True
+    pr_number: int | None = None
+    pr_url: str = ""
+    title: str = ""
+    body: str = ""
+    # Set when a real publish was refused, so the reason is on record.
+    refusal_reason: str = ""
+    actor: str = "operator"
+
+
 class PatchRecord(BaseModel):
     """A captured patch and its content hash (SPEC sections 2H and 2I).
 
