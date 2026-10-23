@@ -60,7 +60,12 @@ class FakeResponse:
 
 
 class FakeHTTP:
-    """Records requests. A POST is a write, so tests assert on the POST count."""
+    """An in-memory GitHub that records requests.
+
+    A POST is a write, so tests assert on the POST count. It models just enough
+    of the object API for a real branch push: branches, file contents, blobs,
+    trees, commits, and refs.
+    """
 
     def __init__(
         self,
@@ -68,6 +73,8 @@ class FakeHTTP:
         branch_sha: str = "a" * 40,
         write_scope: bool = True,
         pr_response: dict | None = None,
+        base_files: dict[str, str] | None = None,
+        existing_branches: list[str] | None = None,
     ) -> None:
         self.branch_sha = branch_sha
         self.write_scope = write_scope
@@ -76,11 +83,28 @@ class FakeHTTP:
             "html_url": f"https://github.com/{SANDBOX}/pull/42",
             "draft": True,
         }
+        # Files on the base branch, readable through the contents endpoint.
+        self.base_files = base_files if base_files is not None else {"p.py": "def f():\n"}
+        self.existing_branches = existing_branches if existing_branches is not None else [BRANCH]
         self.gets: list[str] = []
         self.posts: list[tuple[str, dict]] = []
+        self.created_refs: list[str] = []
+        self.created_commits: list[dict] = []
 
     def get(self, url: str, headers: dict | None = None, **kwargs: object) -> FakeResponse:
         self.gets.append(url)
+        if "/contents/" in url:
+            path = url.split("/contents/")[1].split("?")[0]
+            if path not in self.base_files:
+                return FakeResponse(404)
+            import base64
+
+            encoded = base64.b64encode(self.base_files[path].encode()).decode()
+            return FakeResponse(200, {"content": encoded, "encoding": "base64"})
+        if "/git/ref/heads/" in url:
+            return FakeResponse(200, {"object": {"sha": self.branch_sha}})
+        if url.endswith("/branches?per_page=100") or "/branches?" in url:
+            return FakeResponse(200, [{"name": name} for name in self.existing_branches])
         if "/branches/" in url:
             return FakeResponse(200, {"commit": {"sha": self.branch_sha}})
         # The repository endpoint, used for the permission-scope check.
@@ -89,11 +113,35 @@ class FakeHTTP:
     def post(
         self, url: str, json: dict | None = None, headers: dict | None = None, **kwargs: object
     ) -> FakeResponse:
-        self.posts.append((url, json or {}))
+        payload = json or {}
+        self.posts.append((url, payload))
+        if url.endswith("/git/blobs"):
+            return FakeResponse(201, {"sha": "b" * 40})
+        if url.endswith("/git/trees"):
+            return FakeResponse(201, {"sha": "c" * 40})
+        if url.endswith("/git/commits"):
+            self.created_commits.append(payload)
+            return FakeResponse(201, {"sha": "d" * 40})
+        if url.endswith("/git/refs"):
+            self.created_refs.append(payload.get("ref", ""))
+            return FakeResponse(201, {"ref": payload.get("ref", "")})
         return FakeResponse(201, self.pr_response)
 
     def close(self) -> None:
         pass
+
+    @property
+    def writes(self) -> list[tuple[str, dict]]:
+        """Only the requests that change GitHub state."""
+        return [
+            (url, payload)
+            for url, payload in self.posts
+            if url.endswith("/pulls")
+            or url.endswith("/git/blobs")
+            or url.endswith("/git/trees")
+            or url.endswith("/git/commits")
+            or url.endswith("/git/refs")
+        ]
 
 
 @pytest.fixture
@@ -160,6 +208,11 @@ def seed_ready(conn, repo: str = SANDBOX, number: int = 7, diff: str = DIFF) -> 
 
 def make_client(http: FakeHTTP, token: str = "publish-token-value") -> GitHubWriteClient:
     return GitHubWriteClient(token=token, client=http)
+
+
+def pr_count(http: FakeHTTP) -> int:
+    """How many pull requests were created. Branch writes are counted separately."""
+    return sum(1 for url, _ in http.posts if url.endswith("/pulls"))
 
 
 # ==========================================================================
@@ -465,7 +518,7 @@ def test_duplicate_publish_is_prevented(conn) -> None:
         client=make_client(http),
     )
     assert first.published is True
-    assert len(http.posts) == 1
+    assert pr_count(http) == 1
 
     # A second attempt with the same patch must be refused.
     with pytest.raises(RefusedByPolicyError, match="already published"):
@@ -477,7 +530,7 @@ def test_duplicate_publish_is_prevented(conn) -> None:
             mode=PublishMode.REAL,
             client=make_client(http),
         )
-    assert len(http.posts) == 1, "the second attempt must not have written"
+    assert pr_count(http) == 1, "the second attempt must not have written"
 
 
 def test_idempotence_is_per_patch_not_per_issue(conn) -> None:
@@ -487,7 +540,7 @@ def test_idempotence_is_per_patch_not_per_issue(conn) -> None:
     publisher.publish(
         conn, SANDBOX, 7, target_branch=BRANCH, mode=PublishMode.REAL, client=make_client(http)
     )
-    assert len(http.posts) == 1
+    assert pr_count(http) == 1
 
     # A different patch, freshly approved, is allowed to publish.
     changed = DIFF + "+    return None\n"
@@ -512,7 +565,7 @@ def test_idempotence_is_per_patch_not_per_issue(conn) -> None:
         conn, SANDBOX, 7, target_branch=BRANCH, mode=PublishMode.REAL, client=make_client(http)
     )
     assert second.published is True
-    assert len(http.posts) == 2
+    assert pr_count(http) == 2
 
 
 def test_head_branch_is_deterministic(conn) -> None:
@@ -538,10 +591,14 @@ def test_real_publish_creates_a_draft_pr(conn) -> None:
     assert record.pr_number == 42
     assert record.pr_url == f"https://github.com/{SANDBOX}/pull/42"
 
-    url, payload = http.posts[0]
+    # The PR is the last write, after the branch, tree, and commit.
+    pr_posts = [(url, payload) for url, payload in http.posts if url.endswith("/pulls")]
+    assert len(pr_posts) == 1
+    url, payload = pr_posts[0]
     assert url.endswith(f"/repos/{SANDBOX}/pulls")
     assert payload["draft"] is True
     assert payload["base"] == BRANCH
+    assert payload["head"] == record.head_branch
 
 
 def test_real_publish_moves_the_task_to_published(conn) -> None:
@@ -571,14 +628,19 @@ def test_write_client_exposes_exactly_one_write_method() -> None:
     GitHub action. The check is on the public methods that could reach GitHub.
     """
     # Methods that only read or manage the local HTTP client.
-    lifecycle = {"close", "get_branch", "has_write_scope"}
-    write_like = [
-        name
-        for name in dir(GitHubWriteClient)
-        if not name.startswith("_") and name not in lifecycle
+    reads = {
+        "close",
+        "get_branch",
+        "get_file_content",
+        "get_ref_sha",
+        "has_write_scope",
+        "list_branches",
+    }
+    writes = [
+        name for name in dir(GitHubWriteClient) if not name.startswith("_") and name not in reads
     ]
-    assert write_like == ["create_draft_pull_request"], (
-        f"GitHubWriteClient exposes unexpected public methods: {write_like}"
+    assert sorted(writes) == ["create_draft_pull_request", "push_patch_branch"], (
+        f"GitHubWriteClient exposes unexpected write methods: {writes}"
     )
 
 
@@ -730,7 +792,7 @@ def test_a_revision_cannot_reuse_the_previous_approval(conn) -> None:
             mode=PublishMode.REAL,
             client=make_client(http),
         )
-    assert len(http.posts) == 1, "the unapproved revision must not have been published"
+    assert pr_count(http) == 1, "the unapproved revision must not have been published"
 
 
 def test_published_state_allows_a_revision(conn) -> None:
@@ -844,3 +906,204 @@ def test_cli_publish_refuses_a_third_party_repo(tmp_path) -> None:
     )
     assert result.exit_code == 1
     assert "allowlist" in result.output
+
+
+# ==========================================================================
+# Branch creation guardrails (the approved limits for push_patch_branch)
+# ==========================================================================
+
+
+def client_with(http: FakeHTTP) -> GitHubWriteClient:
+    return make_client(http)
+
+
+def test_push_branch_is_refused_without_approval(conn) -> None:
+    """The branch push sits behind the same checks, so no approval means no write."""
+    seed_to_validating(conn)
+    storage.transition_task_state(conn, SANDBOX, 7, TaskState.FAILED_VALIDATION)
+    storage.record_patch(
+        conn,
+        PatchRecord(
+            repo_full_name=SANDBOX,
+            issue_number=7,
+            provider="mock",
+            patch_sha256=HASH,
+            diff=DIFF,
+        ),
+    )
+    http = FakeHTTP()
+    with pytest.raises(RefusedByPolicyError):
+        publisher.publish(
+            conn,
+            SANDBOX,
+            7,
+            target_branch=BRANCH,
+            mode=PublishMode.REAL,
+            client=client_with(http),
+        )
+    assert http.writes == [], "an unapproved publish must not create a branch"
+
+
+def test_push_branch_is_refused_for_third_party_repo(conn) -> None:
+    """The allowlist still gates the branch push."""
+    digest = compute_patch_sha256(DIFF)
+    seed_to_validating(conn, repo=THIRD_PARTY)
+    storage.record_patch(
+        conn,
+        PatchRecord(
+            repo_full_name=THIRD_PARTY,
+            issue_number=7,
+            provider="mock",
+            patch_sha256=digest,
+            diff=DIFF,
+        ),
+    )
+    storage.record_validation_report(conn, validation_report(THIRD_PARTY, 7, digest))
+    approval.apply_action(conn, THIRD_PARTY, 7, ApprovalAction.APPROVE, target_branch=BRANCH)
+    http = FakeHTTP()
+    with pytest.raises(RefusedByPolicyError, match="allowlist"):
+        publisher.publish(
+            conn,
+            THIRD_PARTY,
+            7,
+            target_branch=BRANCH,
+            mode=PublishMode.REAL,
+            client=client_with(http),
+        )
+    assert http.writes == []
+
+
+def test_push_branch_is_refused_on_duplicate(conn) -> None:
+    """A second publish of the same patch must not create a second branch."""
+    seed_ready(conn)
+    http = FakeHTTP()
+    publisher.publish(
+        conn, SANDBOX, 7, target_branch=BRANCH, mode=PublishMode.REAL, client=client_with(http)
+    )
+    refs_after_first = len(http.created_refs)
+    assert refs_after_first == 1
+
+    with pytest.raises(RefusedByPolicyError, match="already published"):
+        publisher.publish(
+            conn, SANDBOX, 7, target_branch=BRANCH, mode=PublishMode.REAL, client=client_with(http)
+        )
+    assert len(http.created_refs) == refs_after_first, "no second branch may be created"
+
+
+def test_push_branch_is_refused_when_branch_already_exists(conn) -> None:
+    """If the head branch already exists on the remote, refuse rather than update."""
+    seed_ready(conn)
+    head = publisher.head_branch_for(7, HASH)
+    http = FakeHTTP(existing_branches=[BRANCH, head])
+    with pytest.raises((publisher.BranchPolicyError, PublisherError), match="already exists"):
+        publisher.publish(
+            conn, SANDBOX, 7, target_branch=BRANCH, mode=PublishMode.REAL, client=client_with(http)
+        )
+    assert http.created_refs == [], "no ref may be created for an existing branch"
+
+
+def test_push_branch_refuses_main_as_a_head_branch() -> None:
+    """ForgeFlow may never create or write to main."""
+    for name in ("main", "master", "develop", "trunk"):
+        with pytest.raises(publisher.BranchPolicyError):
+            publisher.require_creatable_branch(name)
+
+
+def test_push_branch_requires_the_forgeflow_prefix() -> None:
+    """A branch without the prefix must be refused."""
+    for name in ("fix-thing", "release-1.0", "forgeflowx/issue-1"):
+        with pytest.raises(publisher.BranchPolicyError):
+            publisher.require_creatable_branch(name, existing=[])
+
+
+def test_push_branch_is_refused_if_the_patch_hash_changed(conn) -> None:
+    """A changed patch invalidates the approval, so no branch may be created."""
+    seed_ready(conn)
+    changed = DIFF + "+    return None\n"
+    storage.record_patch(
+        conn,
+        PatchRecord(
+            repo_full_name=SANDBOX,
+            issue_number=7,
+            provider="mock",
+            patch_sha256=compute_patch_sha256(changed),
+            diff=changed,
+        ),
+    )
+    http = FakeHTTP()
+    with pytest.raises(RefusedByPolicyError, match="approval"):
+        publisher.publish(
+            conn, SANDBOX, 7, target_branch=BRANCH, mode=PublishMode.REAL, client=client_with(http)
+        )
+    assert http.writes == [], "no branch may be created for an unapproved patch"
+
+
+def test_push_branch_is_never_reachable_in_a_dry_run(conn) -> None:
+    """The dry run must stop before the branch push."""
+    seed_ready(conn)
+    http = FakeHTTP()
+    publisher.publish(conn, SANDBOX, 7, target_branch=BRANCH, client=client_with(http))
+    assert http.writes == [], "dry run must not create a branch or a PR"
+    assert http.created_refs == []
+
+
+def test_push_branch_creates_a_new_ref_with_the_forgeflow_prefix(conn) -> None:
+    """The successful path creates exactly one ref, under forgeflow/."""
+    seed_ready(conn)
+    http = FakeHTTP()
+    publisher.publish(
+        conn, SANDBOX, 7, target_branch=BRANCH, mode=PublishMode.REAL, client=client_with(http)
+    )
+    assert len(http.created_refs) == 1
+    assert http.created_refs[0].startswith("refs/heads/forgeflow/")
+    # The commit's parent is the base branch tip, so it is not a rewrite.
+    assert len(http.created_commits) == 1
+    assert http.created_commits[0]["parents"] == ["a" * 40]
+
+
+def test_push_branch_never_updates_an_existing_ref(conn) -> None:
+    """Every ref POST must be a create, expressed as refs/heads/<new name>."""
+    seed_ready(conn)
+    http = FakeHTTP()
+    publisher.publish(
+        conn, SANDBOX, 7, target_branch=BRANCH, mode=PublishMode.REAL, client=client_with(http)
+    )
+    ref_posts = [(u, p) for u, p in http.posts if u.endswith("/git/refs")]
+    for _url, payload in ref_posts:
+        assert payload["ref"].startswith("refs/heads/forgeflow/")
+        assert "force" not in payload
+
+
+def test_push_branch_refuses_a_diff_that_does_not_apply(conn) -> None:
+    """A patch that does not apply to the base tree must not create a branch."""
+    seed_ready(conn)
+    # The base branch no longer contains the context the diff expects.
+    http = FakeHTTP(base_files={"p.py": "def totally_different():\n"})
+    with pytest.raises(PublisherError, match="does not apply"):
+        publisher.publish(
+            conn, SANDBOX, 7, target_branch=BRANCH, mode=PublishMode.REAL, client=client_with(http)
+        )
+    assert http.created_refs == [], "no branch may be created from a patch that does not apply"
+
+
+def test_push_branch_refuses_a_missing_base_file(conn) -> None:
+    """If the base tree lacks a file the patch modifies, refuse."""
+    seed_ready(conn)
+    http = FakeHTTP(base_files={})
+    with pytest.raises(PublisherError):
+        publisher.publish(
+            conn, SANDBOX, 7, target_branch=BRANCH, mode=PublishMode.REAL, client=client_with(http)
+        )
+    assert http.created_refs == []
+
+
+def test_pushed_file_content_matches_the_patch(conn) -> None:
+    """The blob written must be the patched content, not the original."""
+    seed_ready(conn)
+    http = FakeHTTP(base_files={"p.py": "def f():\n"})
+    publisher.publish(
+        conn, SANDBOX, 7, target_branch=BRANCH, mode=PublishMode.REAL, client=client_with(http)
+    )
+    blob_posts = [p for u, p in http.posts if u.endswith("/git/blobs")]
+    assert len(blob_posts) == 1
+    assert blob_posts[0]["content"] == "def f():\n    pass\n"

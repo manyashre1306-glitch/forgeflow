@@ -134,9 +134,58 @@ def is_repo_allowed(repo_full_name: str) -> bool:
     return repo_full_name.strip().lower() in {r.lower() for r in PUBLISH_ALLOWLIST}
 
 
+# Every branch ForgeFlow creates must start with this prefix. Enforced by
+# require_creatable_branch, not by convention.
+BRANCH_PREFIX = "forgeflow/"
+
+# Branches ForgeFlow must never write to, whatever the caller asks.
+PROTECTED_BRANCHES: frozenset[str] = frozenset({"main", "master", "develop", "trunk"})
+
+
+class BranchPolicyError(PublisherError):
+    """Raised when a branch name is not permitted. Never a token leak."""
+
+
 def head_branch_for(issue_number: int, patch_sha256: str) -> str:
     """A deterministic head branch name, so a retry targets the same branch."""
-    return f"forgeflow/issue-{issue_number}-{patch_sha256[:12]}"
+    return f"{BRANCH_PREFIX}issue-{issue_number}-{patch_sha256[:12]}"
+
+
+def require_creatable_branch(branch: str, *, existing: list[str] | None = None) -> None:
+    """Raise unless ``branch`` is a new branch ForgeFlow is allowed to create.
+
+    Four rules, all mandatory:
+
+    * the name must start with ``forgeflow/``, so ForgeFlow never creates a
+      branch that looks like a maintainer's;
+    * it must not be a protected branch such as ``main``;
+    * it must not already exist, because ForgeFlow only ever creates new
+      branches and never updates an existing one;
+    * it must be non-empty after the prefix.
+
+    ``existing`` is the list of branch names already on the remote. When it is
+    None the existence rule cannot be checked and the caller must verify
+    separately; the create path always passes a real list.
+    """
+    if not branch:
+        raise BranchPolicyError("branch name is empty")
+    if not branch.startswith(BRANCH_PREFIX):
+        raise BranchPolicyError(
+            f"refusing to create branch {branch!r}: ForgeFlow may only create branches "
+            f"starting with {BRANCH_PREFIX!r}"
+        )
+    if branch.strip() == BRANCH_PREFIX:
+        raise BranchPolicyError(f"refusing to create branch {branch!r}: no name after the prefix")
+    if branch in PROTECTED_BRANCHES:
+        raise BranchPolicyError(
+            f"refusing to write to protected branch {branch!r}: ForgeFlow never writes "
+            "to an existing branch"
+        )
+    if existing is not None and branch in existing:
+        raise BranchPolicyError(
+            f"refusing to create branch {branch!r}: it already exists. ForgeFlow only "
+            "creates new branches and never updates an existing one."
+        )
 
 
 def build_pr_body(
@@ -407,6 +456,56 @@ def plan_publish(
     return plan
 
 
+def _commit_message(issue_number: int, title: str) -> str:
+    """The commit message for the created branch."""
+    return f"{title}\n\nFixes #{issue_number}\n\nCreated by ForgeFlow."
+
+
+def _files_for_patch(
+    client: GitHubWriteClient,
+    repo_full_name: str,
+    base_branch: str,
+    diff: str,
+) -> dict[str, str]:
+    """Turn a stored diff into the full file contents to commit.
+
+    Reads each touched file from the base branch and applies the diff strictly.
+    Raises if the diff does not apply, so a branch is never created carrying
+    content that does not match the approved patch.
+    """
+    from forgeflow.diff_apply import DiffApplyError, apply_diff, parse_unified_diff
+
+    try:
+        changes = parse_unified_diff(diff)
+    except DiffApplyError as exc:
+        raise PublisherError(f"the stored patch could not be parsed: {exc}") from exc
+    if not changes:
+        raise PublisherError("the stored patch contains no file changes")
+
+    base_files: dict[str, str] = {}
+    for change in changes:
+        if change.is_new:
+            continue
+        try:
+            base_files[change.old_path] = client.get_file_content(
+                repo_full_name, change.old_path, base_branch
+            )
+        except PublisherError as exc:
+            raise PublisherError(
+                f"the patch modifies {change.old_path!r}, which could not be read "
+                f"from {base_branch}: {exc}"
+            ) from exc
+
+    try:
+        return apply_diff(diff, base_files)
+    except DiffApplyError as exc:
+        raise PublisherError(
+            f"the stored patch does not apply cleanly to {base_branch}: {exc}. "
+            "Refusing to create a branch with content that does not match the "
+            "approved patch."
+        ) from exc
+
+
 def publish(
     conn: sqlite3.Connection,
     repo_full_name: str,
@@ -480,6 +579,33 @@ def publish(
     if client is None:
         raise PublisherError("a real publish requires a GitHub write client; none was supplied")
 
+    # Real write, step 1 of 2: create the head branch carrying the patch. The
+    # branch policy is re-checked here against the repository's real branch
+    # list, so an existing branch is refused even if the database forgot.
+    stored_patch = storage.latest_patch(conn, repo_full_name, issue_number)
+    if stored_patch is None:
+        raise PublisherError("the patch disappeared between planning and publishing")
+    files = _files_for_patch(client, repo_full_name, target_branch, stored_patch.diff)
+    existing = client.list_branches(repo_full_name)
+    client.push_patch_branch(
+        repo_full_name=repo_full_name,
+        branch=plan.head_branch,
+        base_branch=target_branch,
+        files=files,
+        commit_message=_commit_message(issue_number, plan.title),
+        existing_branches=existing,
+    )
+    audit.record(
+        conn,
+        "publish.branch_created",
+        repo_full_name=repo_full_name,
+        issue_number=issue_number,
+        actor=actor,
+        detail=f"created branch {plan.head_branch}",
+        payload={"branch": plan.head_branch, "files": sorted(files)},
+    )
+
+    # Real write, step 2 of 2: open the DRAFT PR from that branch.
     result = client.create_draft_pull_request(
         repo_full_name=repo_full_name,
         head_branch=plan.head_branch,
@@ -596,6 +722,113 @@ class GitHubWriteClient:
         if not isinstance(permissions, dict):
             return False
         return bool(permissions.get("push"))
+
+    def get_ref_sha(self, repo_full_name: str, branch: str) -> str:
+        """Read the commit SHA a branch points at, or raise if it is absent."""
+        payload = self._get(f"/repos/{repo_full_name}/git/ref/heads/{branch}")
+        obj = payload.get("object") if isinstance(payload, dict) else None
+        if not isinstance(obj, dict) or not obj.get("sha"):
+            raise PublisherError(f"branch {branch!r} has no commit")
+        return str(obj["sha"])
+
+    def list_branches(self, repo_full_name: str) -> list[str]:
+        """Every branch name on the repository. Used by the existence check."""
+        payload = self._get(f"/repos/{repo_full_name}/branches?per_page=100")
+        if not isinstance(payload, list):
+            raise PublisherError("GitHub returned an unexpected branches response")
+        return [str(item.get("name", "")) for item in payload if isinstance(item, dict)]
+
+    def get_file_content(self, repo_full_name: str, path: str, ref: str) -> str:
+        """Read one file's text at a ref. Raises if the file is absent."""
+        payload = self._get(f"/repos/{repo_full_name}/contents/{path}?ref={ref}")
+        if not isinstance(payload, dict):
+            raise PublisherError(f"unexpected content response for {path!r}")
+        import base64
+
+        content = payload.get("content")
+        if not isinstance(content, str):
+            raise PublisherError(f"{path!r} has no readable content")
+        try:
+            decoded = base64.b64decode(content, validate=False)
+        except Exception as exc:
+            raise PublisherError(f"{path!r} content is not valid base64") from exc
+        return decoded.decode("utf-8", errors="replace")
+
+    def _post(self, path: str, payload: dict) -> dict:
+        url = f"{self._base_url}{path}"
+        response = self._client.post(url, json=payload, headers=self._headers())  # type: ignore[attr-defined]
+        if response.status_code >= 400:
+            raise PublisherError(
+                f"GitHub returned {response.status_code} for {path}: {_safe_message(response)}"
+            )
+        result = response.json()
+        if not isinstance(result, dict):
+            raise PublisherError("GitHub returned an unexpected response body")
+        return result
+
+    def push_patch_branch(
+        self,
+        *,
+        repo_full_name: str,
+        branch: str,
+        base_branch: str,
+        files: dict[str, str],
+        commit_message: str,
+        existing_branches: list[str],
+    ) -> dict:
+        """Create a NEW branch carrying ``files``, via the GitHub object API.
+
+        Refuses in five cases before any write, matching the approved limits:
+
+        * the branch name is not permitted (prefix, protected, or empty);
+        * the branch already exists;
+        * the base branch does not exist;
+        * there are no files to write.
+
+        Uses blob, tree, commit, then ref, which creates a branch. There is no
+        update path: this method can only create. No local git runs, and a force
+        update is impossible because a new ref cannot be force-updated.
+        """
+        require_creatable_branch(branch, existing=existing_branches)
+        if not files:
+            raise PublisherError("no files to write to the branch")
+        if branch == base_branch:
+            raise PublisherError(f"refusing to write the head branch {branch!r} onto itself")
+
+        base_sha = self.get_ref_sha(repo_full_name, base_branch)
+
+        tree_items: list[dict] = []
+        for path, content in files.items():
+            blob = self._post(
+                f"/repos/{repo_full_name}/git/blobs",
+                {"content": content, "encoding": "utf-8"},
+            )
+            blob_sha = blob.get("sha")
+            if not blob_sha:
+                raise PublisherError(f"GitHub did not return a blob sha for {path!r}")
+            tree_items.append({"path": path, "mode": "100644", "type": "blob", "sha": blob_sha})
+
+        tree = self._post(
+            f"/repos/{repo_full_name}/git/trees",
+            {"base_tree": base_sha, "tree": tree_items},
+        )
+        tree_sha = tree.get("sha")
+        if not tree_sha:
+            raise PublisherError("GitHub did not return a tree sha")
+
+        commit = self._post(
+            f"/repos/{repo_full_name}/git/commits",
+            {"message": commit_message, "tree": tree_sha, "parents": [base_sha]},
+        )
+        commit_sha = commit.get("sha")
+        if not commit_sha:
+            raise PublisherError("GitHub did not return a commit sha")
+
+        ref = self._post(
+            f"/repos/{repo_full_name}/git/refs",
+            {"ref": f"refs/heads/{branch}", "sha": commit_sha},
+        )
+        return ref
 
     def create_draft_pull_request(
         self,
