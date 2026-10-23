@@ -45,7 +45,14 @@ from forgeflow.models import (
     Issue,
     TaskState,
 )
-from forgeflow.pipeline import PipelineError, run_analysis, run_context, run_implement, run_review
+from forgeflow.pipeline import (
+    PipelineError,
+    run_analysis,
+    run_context,
+    run_implement,
+    run_review,
+    run_validation,
+)
 from forgeflow.ranking import rank_issues, resolve_weights, total_for
 from forgeflow.repository_context import (
     RepositoryContextError,
@@ -55,6 +62,7 @@ from forgeflow.repository_context import (
     workspace_size_bytes,
 )
 from forgeflow.sandbox import IsolationError, build_sandbox
+from forgeflow.validation import build_validator
 
 DEFAULT_CONFIG_PATH = Path("config/repositories.yaml")
 DEFAULT_DB_PATH = Path("data/forgeflow.db")
@@ -936,6 +944,95 @@ def discard(
     _approval_common(
         issue, db_path, config_path, target_branch, actor, reason, ApprovalAction.DISCARD
     )
+
+
+@app.command()
+def validate(
+    issue: Annotated[str, typer.Argument(help="Issue reference, e.g. owner/repo#123.")],
+    db_path: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
+    config_path: Annotated[Path, typer.Option("--config")] = DEFAULT_CONFIG_PATH,
+    workspace_root: Annotated[Path, typer.Option("--workspace-root")] = Path("data/workspaces"),
+    timeout: Annotated[
+        float, typer.Option("--timeout", help="Per-check wall-clock limit in seconds.")
+    ] = 900.0,
+    repair_attempts: Annotated[
+        int, typer.Option("--repair-attempts", help="Repairs already made (SPEC 7 caps this at 2).")
+    ] = 0,
+) -> None:
+    """Run the target repository's tests and lint checks against the latest patch.
+
+    Every command runs in the sandbox. With no container isolation the checks are
+    recorded as skipped with the reason, and the task fails validation rather than
+    advancing on unproven code.
+    """
+    repo_full_name, number = parse_issue_reference(issue)
+    try:
+        config = load_app_config(config_path)
+        conn = open_db(db_path)
+        require_kill_switch_clear(config, None, conn)
+    except KillSwitchEngagedError as exc:
+        console.print(f"[red]kill switch:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    except ForgeFlowError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    try:
+        validator = build_validator(
+            sandbox=build_sandbox(app_config=config),
+            timeout=timeout,
+            app_config=config,
+        )
+        outcome = run_validation(
+            conn,
+            repo_full_name,
+            number,
+            validator=validator,
+            workspace_root=workspace_root,
+            repair_attempts=repair_attempts,
+        )
+    except PipelineError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    except IsolationError as exc:
+        console.print(f"[red]isolation:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    finally:
+        conn.close()
+
+    report = outcome.report
+    table = Table(title=f"validation: {repo_full_name}#{number}")
+    table.add_column("check")
+    table.add_column("status")
+    table.add_column("exit")
+    table.add_column("detail")
+    for check in report.checks:
+        detail = check.skip_reason or check.limitation or ""
+        table.add_row(
+            check.name,
+            check.status.value,
+            str(check.exit_code) if check.exit_code is not None else "-",
+            detail[:50],
+        )
+    console.print(table)
+
+    if report.findings:
+        console.print(f"[yellow]{len(report.findings)} diff finding(s):[/yellow]")
+        for finding in report.findings:
+            console.print(f"  [{finding.severity}] {finding.category}: {finding.detail}")
+
+    for limitation in report.environment_limitations:
+        console.print(f"[yellow]limitation:[/yellow] {limitation}")
+
+    if outcome.passed:
+        console.print(f"[green]validation passed[/green] - state: {outcome.issue.task_state.value}")
+        return
+
+    console.print(
+        f"[red]validation FAILED[/red] - state: {outcome.issue.task_state.value}. "
+        "Publishing is blocked."
+    )
+    raise typer.Exit(code=1)
 
 
 if __name__ == "__main__":

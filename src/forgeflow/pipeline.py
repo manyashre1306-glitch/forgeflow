@@ -17,22 +17,25 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
-from forgeflow import storage
+from forgeflow import audit, storage
 from forgeflow.agent_runner import AgentResult, CodingAgent
 from forgeflow.config import AppConfig
 from forgeflow.issue_analyzer import IssueAnalyzer
 from forgeflow.models import (
     AnalysisRecord,
     AnalysisResult,
+    CheckStatus,
     Issue,
     PatchRecord,
     RepoContext,
     TaskState,
+    ValidationReport,
 )
 from forgeflow.patch import PatchError, build_patch_record, workspace_diff
 from forgeflow.repository_context import prepare_repo_context, workspace_path_for
 from forgeflow.review import review_report_path, write_review_report
 from forgeflow.sandbox import Sandbox
+from forgeflow.validation import ValidationCommands, Validator
 
 
 class PipelineError(RuntimeError):
@@ -118,6 +121,15 @@ class ImplementOutcome:
     issue: Issue
     executed_in_sandbox: bool
     limitations: list[str]
+
+
+@dataclass
+class ValidationOutcome:
+    """Result of the validation step (SPEC section 7)."""
+
+    report: ValidationReport
+    issue: Issue
+    passed: bool
 
 
 @dataclass
@@ -352,6 +364,96 @@ def run_implement(
         executed_in_sandbox=executed_in_sandbox,
         limitations=limitations,
     )
+
+
+def run_validation(
+    conn: sqlite3.Connection,
+    repo_full_name: str,
+    issue_number: int,
+    *,
+    validator: Validator,
+    workspace_root: Path | str = "data/workspaces",
+    commands: ValidationCommands | None = None,
+    repair_attempts: int = 0,
+) -> ValidationOutcome:
+    """Run the quality gates for the latest patch (SPEC section 7).
+
+    The task must be at ``validating``; the implementation step leaves it there.
+    A passing report leaves the task at ``validating`` so a human can approve it.
+    A report with a blocking failure moves the task to ``failed_validation``,
+    which is what stops it reaching publishing. A report that ran nothing (no
+    isolation) is treated as not passing, so it also fails validation rather
+    than silently advancing.
+    """
+    issue = _load_issue(conn, repo_full_name, issue_number)
+
+    if issue.task_state is not TaskState.VALIDATING:
+        raise PipelineError(
+            f"cannot validate {repo_full_name}#{issue_number}: task is at "
+            f"'{issue.task_state.value}', expected 'validating'. Run "
+            f"'forgeflow implement' first."
+        )
+
+    patch = storage.latest_patch(conn, repo_full_name, issue_number)
+    if patch is None:
+        raise PipelineError(
+            f"no patch recorded for {repo_full_name}#{issue_number}; "
+            "run 'forgeflow implement' first"
+        )
+
+    workspace = workspace_path_for(workspace_root, repo_full_name, issue_number)
+    report = validator.validate(
+        repo_full_name,
+        issue_number,
+        patch.patch_sha256,
+        patch.diff,
+        workspace,
+        commands=commands,
+        repair_attempts=repair_attempts,
+    )
+
+    passed = report.may_publish
+
+    if passed:
+        audit.record(
+            conn,
+            "validation.passed",
+            repo_full_name=repo_full_name,
+            issue_number=issue_number,
+            detail=f"{len(report.checks)} checks recorded",
+            payload={"patch_sha256": patch.patch_sha256},
+        )
+        return ValidationOutcome(report=report, issue=issue, passed=True)
+
+    reasons = [f"{check.name}: {check.status.value}" for check in report.blocking_failures]
+    if not reasons:
+        reasons = [
+            f"{check.name}: {check.status.value} (no execution evidence)"
+            for check in report.checks
+            if check.status is not CheckStatus.PASSED
+        ]
+    if not reasons:
+        reasons = [finding.detail for finding in report.findings if finding.severity == "blocking"]
+
+    issue = storage.transition_task_state(
+        conn,
+        repo_full_name,
+        issue_number,
+        TaskState.FAILED_VALIDATION,
+        actor="forgeflow",
+        reason="validation failed: " + "; ".join(reasons[:3]),
+    )
+    audit.record(
+        conn,
+        "validation.failed",
+        repo_full_name=repo_full_name,
+        issue_number=issue_number,
+        severity="warning",
+        detail="; ".join(reasons[:3]),
+        payload={"patch_sha256": patch.patch_sha256},
+    )
+
+    return ValidationOutcome(report=report, issue=issue, passed=False)
 
 
 def run_review(
