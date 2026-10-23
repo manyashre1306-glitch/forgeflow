@@ -412,6 +412,10 @@ def run_validation(
         repair_attempts=repair_attempts,
     )
 
+    # Persist before deciding, so the evidence exists even if the transition
+    # below raises. The rows are the enforcement input for the approval gate.
+    storage.record_validation_report(conn, report)
+
     passed = report.may_publish
 
     if passed:
