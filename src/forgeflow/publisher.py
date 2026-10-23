@@ -451,9 +451,68 @@ def plan_publish(
         issue_number=issue_number,
         patch_sha256=patch.patch_sha256,
         diff=patch.diff,
-        limitations=[],
+        analysis_summary=_analysis_summary(conn, repo_full_name, issue_number),
+        test_summary=_test_summary(conn, repo_full_name, issue_number, patch.patch_sha256),
+        limitations=_limitations(conn, repo_full_name, issue_number, patch.patch_sha256),
     )
     return plan
+
+
+def _analysis_summary(conn: sqlite3.Connection, repo_full_name: str, issue_number: int) -> str:
+    """The stored analysis summary, or empty when none was recorded."""
+    record = storage.latest_analysis(conn, repo_full_name, issue_number)
+    if record is None:
+        return ""
+    for attribute in ("summary", "approach", "plan"):
+        value = getattr(record, attribute, "")
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _test_summary(
+    conn: sqlite3.Connection,
+    repo_full_name: str,
+    issue_number: int,
+    patch_sha256: str,
+) -> str:
+    """A factual summary of the validation checks recorded for this patch.
+
+    Reports exactly what ran and what it returned. A skipped check is reported
+    as skipped, never as a pass, because the PR body is read by a maintainer who
+    will trust it.
+    """
+    rows = storage.list_validation_results(
+        conn, repo_full_name, issue_number, patch_sha256=patch_sha256
+    )
+    if not rows:
+        return ""
+    lines: list[str] = []
+    for row in rows:
+        name = str(row.get("name") or row.get("kind") or "check")
+        status = str(row.get("status") or "unknown")
+        exit_code = row.get("exit_code")
+        suffix = f" (exit {exit_code})" if exit_code is not None else ""
+        lines.append(f"- `{name}`: {status}{suffix}")
+    return "\n".join(lines)
+
+
+def _limitations(
+    conn: sqlite3.Connection,
+    repo_full_name: str,
+    issue_number: int,
+    patch_sha256: str,
+) -> list[str]:
+    """Environment limitations and skipped checks recorded for this patch."""
+    rows = storage.list_validation_results(
+        conn, repo_full_name, issue_number, patch_sha256=patch_sha256
+    )
+    found: list[str] = []
+    for row in rows:
+        reason = row.get("skip_reason")
+        if isinstance(reason, str) and reason.strip():
+            found.append(reason.strip())
+    return found
 
 
 def _commit_message(issue_number: int, title: str) -> str:

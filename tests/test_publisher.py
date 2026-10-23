@@ -1107,3 +1107,47 @@ def test_pushed_file_content_matches_the_patch(conn) -> None:
     blob_posts = [p for u, p in http.posts if u.endswith("/git/blobs")]
     assert len(blob_posts) == 1
     assert blob_posts[0]["content"] == "def f():\n    pass\n"
+
+
+# ==========================================================================
+# The PR body reports only recorded facts
+# ==========================================================================
+
+
+def test_pr_body_includes_recorded_test_evidence(conn) -> None:
+    """A passing check must appear in the body, not a 'no evidence' placeholder."""
+    seed_ready(conn)
+    plan = publisher.plan_publish(conn, SANDBOX, 7, target_branch=BRANCH)
+    assert "`pytest`: passed" in plan.body
+    assert "No test evidence was recorded" not in plan.body
+
+
+def test_pr_body_says_so_when_no_evidence_exists() -> None:
+    """With no validation passed in, the body must say so rather than imply a pass.
+
+    Called directly because the approval gate means a task cannot reach
+    awaiting_publish_approval without a passing check, so this branch of the body
+    builder is only reachable in its own right.
+    """
+    body = publisher.build_pr_body(
+        repo_full_name=SANDBOX,
+        issue_number=9,
+        patch_sha256=HASH,
+        diff=DIFF,
+    )
+    assert "No test evidence was recorded" in body
+    assert "No analysis summary was recorded" in body
+    assert "passed" not in body, "the body must not imply a check passed"
+
+
+def test_pr_body_includes_the_patch_hash(conn) -> None:
+    """The body must carry the hash that binds it to the approved patch."""
+    digest = seed_ready(conn)
+    plan = publisher.plan_publish(conn, SANDBOX, 7, target_branch=BRANCH)
+    assert digest in plan.body
+
+
+def test_pr_body_states_it_is_not_auto_merged(conn) -> None:
+    seed_ready(conn)
+    plan = publisher.plan_publish(conn, SANDBOX, 7, target_branch=BRANCH)
+    assert "not auto-merged" in plan.body
