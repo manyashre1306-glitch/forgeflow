@@ -121,3 +121,44 @@ STEP 4.3 gap closed and STEP 4.4 added.
   gained threat 9 (gaming the outcome metric).
 
 Current gate state: 898 tests pass, ruff check and format clean.
+
+## Phase 5 state (2026-10-24)
+
+Phase 5 is complete on branch `feat/phase5-docs-and-evaluation` (not merged, no
+PR opened). Deliverables: architecture diagrams (`docs/architecture.md`), the
+threat model (`docs/threat-model.md`), the evaluation harness and results
+(`evaluation/`, `docs/evaluation.md`), cost controls (`docs/cost-controls.md`),
+reproducible setup (`docs/setup.md`), the offline dry-run demo (`demo/`,
+`docs/demonstration.md`), read-only CI (`.github/workflows/ci.yml`), a Makefile,
+the portfolio README, and the SPEC audit (`docs/spec-audit.md`).
+
+Environment facts confirmed this phase (re-measured, do not assume otherwise):
+
+- **No container runtime.** `sandbox.detect_backend()` returns
+  `IsolationKind.NONE`. The sandbox refuses; there is no host fallback.
+- **No `GEMINI_API_KEY` and no `JULES_API_KEY`.** Both providers fail closed.
+- **One real publish only.** `forgeflow-sandbox#2` (open, draft, not merged,
+  0 reviews, 0 comments as of 2026-10-24). No upstream contributions.
+- **Phase 5 adds no external write and no new credential.**
+
+Facts future work must not undo:
+
+- **`demo/` is offline and dry-run only.** It uses `MockAgent` and in-process
+  fake GitHub clients that count write requests; `tests/test_demo.py` asserts
+  zero writes. Keep it that way.
+- **Evaluation is fixture arithmetic, not a benchmark.** SWE-bench is not run;
+  `time_saved_hours` reports "not measured"; empty denominators report "not
+  enough data". Do not add headline rates over the single synthetic publish.
+- **The README Contributions section is checked against the GitHub API, not
+  recalled.** Only list PRs that actually exist, with their true status.
+- **`docs/spec-audit.md` marks PARTIAL for anything this environment cannot
+  exercise** (real model calls, real validation, automated integration test,
+  SWE-bench). Do not upgrade a PARTIAL to DONE without new evidence.
+
+Conventions preserved: every repository free-text field is an `UntrustedText`
+rendered only inside its data fence; analysis output is `extra="forbid"`;
+`check_budget()` runs before every paid call; approval binds to the SHA-256 of
+the exact diff bytes; gates after every step are `uv run python -m ruff check .`,
+`uv run python -m ruff format --check .`, `uv run python -m pytest -q`.
+
+Current gate state: 923 tests pass, ruff check and format clean.
