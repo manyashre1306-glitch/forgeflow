@@ -7,6 +7,9 @@ key is required.
 from __future__ import annotations
 
 import json
+import re
+import socket
+import urllib.error
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -450,7 +453,11 @@ def test_secrets_are_never_placed_in_the_prompt(conn, monkeypatch) -> None:
 # --- backend selection ------------------------------------------------------
 
 
-def test_gemini_backend_without_key_is_unavailable() -> None:
+def test_gemini_backend_without_key_is_unavailable(monkeypatch) -> None:
+    # Unset the key inside the test: if the developer's environment has a real
+    # GEMINI_API_KEY, the default would read it and the test would fail for a
+    # reason unrelated to the code under test.
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     available, reason = GeminiBackend(api_key=None).is_available()
     assert available is False
     assert "GEMINI_API_KEY" in reason
@@ -466,6 +473,60 @@ def test_gemini_backend_refuses_before_network() -> None:
 def test_gemini_backend_reads_key_from_env(monkeypatch) -> None:
     monkeypatch.setenv("GEMINI_API_KEY", "k")
     assert GeminiBackend().is_available()[0] is True
+
+
+# --- timeouts ---------------------------------------------------------------
+
+
+def _call_backend(monkeypatch, raiser) -> None:
+    import urllib.request
+
+    def fake_urlopen(*args, **kwargs):
+        raise raiser
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    GeminiBackend(api_key="k").complete(
+        system="s", prompt="p", model="m", timeout=7.0, max_output_tokens=10
+    )
+
+
+@pytest.mark.parametrize(
+    "raiser",
+    [
+        TimeoutError("timed out"),
+        # socket.timeout is an alias of TimeoutError on 3.10+. Kept explicit so
+        # the test fails loudly if the alias ever diverges.
+        socket.timeout("timed out"),  # noqa: UP041
+        urllib.error.URLError(TimeoutError("timed out")),
+    ],
+)
+def test_gemini_backend_maps_timeouts_to_a_clean_error(monkeypatch, raiser) -> None:
+    """A read timeout must surface as AnalyzerError, never as a raw traceback.
+
+    ``urlopen`` raises TimeoutError directly, and can also wrap it in a
+    URLError. All three shapes must reach the caller as the same clean error so
+    the retry loop records and retries it.
+    """
+    with pytest.raises(AnalyzerError, match=re.escape("timed out after 7.0s")):
+        _call_backend(monkeypatch, raiser)
+
+
+def test_timeout_attempt_is_recorded_and_retried(conn, monkeypatch) -> None:
+    """A timed-out attempt is written to llm_usage and the call is retried."""
+    analyzer = make_analyzer(conn, GeminiBackend(api_key="k"), max_retries=1)
+    import urllib.request
+
+    def fake_urlopen(*args, **kwargs):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    with pytest.raises(AnalyzerError, match="timed out"):
+        analyzer.triage(make_context())
+
+    rows = storage.list_llm_usage(conn)
+    assert len(rows) == 2  # both attempts recorded, not silently dropped
+    assert all(row.success is False for row in rows)
+    assert all("timed out" in (row.error or "") for row in rows)
 
 
 def test_parse_gemini_response_extracts_text_and_usage() -> None:

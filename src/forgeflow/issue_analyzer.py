@@ -175,7 +175,16 @@ class GeminiBackend:
             detail = exc.read().decode("utf-8", errors="replace")[:300]
             raise AnalyzerError(f"model API HTTP {exc.code}: {detail}") from exc
         except urllib.error.URLError as exc:
+            # A socket timeout can arrive wrapped in a URLError. Map it to the
+            # same clean timeout error so the caller records and retries it
+            # instead of letting a bare TimeoutError escape as a traceback.
+            if isinstance(exc.reason, TimeoutError):
+                raise AnalyzerError(f"model API request timed out after {timeout}s") from exc
             raise AnalyzerError(f"model API unreachable: {exc.reason}") from exc
+        except TimeoutError as exc:
+            # Covers socket.timeout too: since Python 3.10 it is an alias of the
+            # builtin TimeoutError, which urlopen raises on a read timeout.
+            raise AnalyzerError(f"model API request timed out after {timeout}s") from exc
         except json.JSONDecodeError as exc:
             raise ModelResponseError(f"model API returned invalid JSON: {exc}") from exc
 
