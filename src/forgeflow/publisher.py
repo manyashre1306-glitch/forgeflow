@@ -98,6 +98,10 @@ class PublishPlan:
     # reviewer can weigh the claim.
     evidence_isolated: bool = False
     issue_verified: bool = False
+    # Set when publishing is authorized by a recorded exception rather than by
+    # an executed check. The body must say so rather than implying a pass.
+    exception_authorized_by: str = ""
+    exception_reason: str = ""
 
     @property
     def allowed(self) -> bool:
@@ -193,6 +197,66 @@ def require_creatable_branch(branch: str, *, existing: list[str] | None = None) 
         )
 
 
+def _validation_section(
+    *,
+    executed_summary: str,
+    skipped_summary: str,
+    evidence_isolated: bool,
+    exception_authorized_by: str,
+    exception_reason: str,
+) -> list[str]:
+    """The Validation lines, stated so the reader cannot misread the evidence.
+
+    The important distinction is whether any check actually executed. A skipped
+    check is not a pass, so when everything was skipped the body says plainly
+    that no checks were executed, and if a human authorized publishing anyway it
+    names them and quotes their reason.
+    """
+    executed = bool(executed_summary.strip())
+    authorized = bool(exception_authorized_by or exception_reason)
+
+    if executed:
+        lines = [_evidence_note(evidence_isolated), "", executed_summary.strip()]
+        if authorized:
+            lines.append("")
+            lines.append(_exception_line(exception_authorized_by, exception_reason))
+        return lines
+
+    if authorized:
+        lines = [
+            "> **No checks were executed for this patch.** The test suite was not "
+            "run, so there is no passing result to report.",
+            ">",
+            "> Publishing was authorized by a **recorded validation exception**.",
+            ">",
+            f"> {_exception_line(exception_authorized_by, exception_reason)}",
+        ]
+        if skipped_summary.strip():
+            lines.append(">")
+            lines.append("> Checks that were skipped:")
+            lines.extend(f"> - {line.lstrip('- ')}" for line in skipped_summary.splitlines())
+        return lines
+
+    if skipped_summary.strip():
+        return [
+            "**No checks were executed.** Every check was skipped:",
+            "",
+            skipped_summary.strip(),
+        ]
+
+    return ["_No test evidence was recorded for this patch._"]
+
+
+def _exception_line(authorized_by: str, reason: str) -> str:
+    """One sentence naming who authorized publishing and why."""
+    parts: list[str] = []
+    if authorized_by:
+        parts.append(f"authorized by `{authorized_by}`")
+    if reason:
+        parts.append(f"reason: {reason}")
+    return "Exception " + "; ".join(parts) if parts else "Exception recorded."
+
+
 def _evidence_note(evidence_isolated: bool) -> str:
     """One line stating how trustworthy the reported checks are.
 
@@ -219,10 +283,13 @@ def build_pr_body(
     patch_sha256: str,
     diff: str,
     analysis_summary: str = "",
-    test_summary: str = "",
+    executed_summary: str = "",
+    skipped_summary: str = "",
     limitations: list[str] | None = None,
     evidence_isolated: bool = False,
     issue_verified: bool = False,
+    exception_authorized_by: str = "",
+    exception_reason: str = "",
 ) -> str:
     """Compose the PR body from recorded facts.
 
@@ -250,9 +317,13 @@ def build_pr_body(
         "",
         "## Validation",
         "",
-        _evidence_note(evidence_isolated),
-        "",
-        test_summary.strip() or "_No test evidence was recorded for this patch._",
+        *_validation_section(
+            executed_summary=executed_summary,
+            skipped_summary=skipped_summary,
+            evidence_isolated=evidence_isolated,
+            exception_authorized_by=exception_authorized_by,
+            exception_reason=exception_reason,
+        ),
         "",
         "## Patch",
         "",
@@ -492,6 +563,12 @@ def plan_publish(
         conn, repo_full_name, issue_number, patch.patch_sha256
     )
     plan.issue_verified = _issue_verified(client, repo_full_name, issue_number)
+    exception = storage.validation_exception_for_patch(
+        conn, repo_full_name, issue_number, patch.patch_sha256
+    )
+    if exception is not None:
+        plan.exception_authorized_by = str(exception.get("authorized_by") or "")
+        plan.exception_reason = str(exception.get("reason") or "")
 
     plan.body = build_pr_body(
         repo_full_name=repo_full_name,
@@ -499,10 +576,13 @@ def plan_publish(
         patch_sha256=patch.patch_sha256,
         diff=patch.diff,
         analysis_summary=_analysis_summary(conn, repo_full_name, issue_number),
-        test_summary=_test_summary(conn, repo_full_name, issue_number, patch.patch_sha256),
+        executed_summary=_executed_summary(conn, repo_full_name, issue_number, patch.patch_sha256),
+        skipped_summary=_skipped_summary(conn, repo_full_name, issue_number, patch.patch_sha256),
         limitations=_limitations(conn, repo_full_name, issue_number, patch.patch_sha256),
         evidence_isolated=plan.evidence_isolated,
         issue_verified=plan.issue_verified,
+        exception_authorized_by=plan.exception_authorized_by,
+        exception_reason=plan.exception_reason,
     )
     return plan
 
@@ -556,30 +636,53 @@ def _analysis_summary(conn: sqlite3.Connection, repo_full_name: str, issue_numbe
     return ""
 
 
-def _test_summary(
+def _executed_summary(
     conn: sqlite3.Connection,
     repo_full_name: str,
     issue_number: int,
     patch_sha256: str,
 ) -> str:
-    """A factual summary of the validation checks recorded for this patch.
+    """A factual summary of checks that actually executed for this patch.
 
-    Reports exactly what ran and what it returned. A skipped check is reported
-    as skipped, never as a pass, because the PR body is read by a maintainer who
-    will trust it.
+    Skipped checks are excluded on purpose. A skipped check is not evidence that
+    anything passed, so it must not appear in the executed list.
     """
     rows = storage.list_validation_results(
         conn, repo_full_name, issue_number, patch_sha256=patch_sha256
     )
-    if not rows:
+    executed = [
+        row for row in rows if str(row.get("status") or "") in {"passed", "failed", "errored"}
+    ]
+    if not executed:
         return ""
     lines: list[str] = []
-    for row in rows:
+    for row in executed:
         name = str(row.get("name") or row.get("kind") or "check")
         status = str(row.get("status") or "unknown")
         exit_code = row.get("exit_code")
         suffix = f" (exit {exit_code})" if exit_code is not None else ""
         lines.append(f"- `{name}`: {status}{suffix}")
+    return "\n".join(lines)
+
+
+def _skipped_summary(
+    conn: sqlite3.Connection,
+    repo_full_name: str,
+    issue_number: int,
+    patch_sha256: str,
+) -> str:
+    """A factual summary of checks that were skipped, with the reason."""
+    rows = storage.list_validation_results(
+        conn, repo_full_name, issue_number, patch_sha256=patch_sha256
+    )
+    skipped = [row for row in rows if str(row.get("status") or "") == "skipped"]
+    if not skipped:
+        return ""
+    lines: list[str] = []
+    for row in skipped:
+        name = str(row.get("name") or row.get("kind") or "check")
+        reason = str(row.get("skip_reason") or "no reason recorded")
+        lines.append(f"- `{name}`: skipped — {reason}")
     return "\n".join(lines)
 
 

@@ -1174,7 +1174,7 @@ def test_body_discloses_missing_container_isolation() -> None:
         issue_number=7,
         patch_sha256=HASH,
         diff=DIFF,
-        test_summary="- `pytest`: passed (exit 0)",
+        executed_summary="- `pytest`: passed (exit 0)",
         evidence_isolated=False,
         issue_verified=True,
     )
@@ -1188,7 +1188,7 @@ def test_body_states_when_evidence_was_isolated() -> None:
         issue_number=7,
         patch_sha256=HASH,
         diff=DIFF,
-        test_summary="- `pytest`: passed (exit 0)",
+        executed_summary="- `pytest`: passed (exit 0)",
         evidence_isolated=True,
         issue_verified=True,
     )
@@ -1287,3 +1287,119 @@ def test_plan_claims_fixes_when_the_issue_exists(conn) -> None:
     plan = publisher.plan_publish(conn, SANDBOX, 7, target_branch=BRANCH, client=make_client(http))
     assert plan.issue_verified is True
     assert plan.body.startswith("Fixes #7")
+
+
+# ==========================================================================
+# An exception with no executed checks must read as exactly that
+# ==========================================================================
+
+EXCEPTION_REASON = "synthetic sandbox test change, no container runtime, tests not executed"
+
+
+def test_body_says_no_checks_executed_when_an_exception_is_recorded() -> None:
+    """The exception case must state plainly that nothing ran."""
+    body = publisher.build_pr_body(
+        repo_full_name=SANDBOX,
+        issue_number=1,
+        patch_sha256=HASH,
+        diff=DIFF,
+        exception_authorized_by="manyashre",
+        exception_reason=EXCEPTION_REASON,
+        issue_verified=True,
+    )
+    assert "No checks were executed" in body
+    assert "recorded validation exception" in body
+    assert EXCEPTION_REASON in body
+    assert "manyashre" in body
+    # It must not read as a pass.
+    assert "passed" not in body.lower()
+
+
+def test_body_lists_skipped_checks_under_an_exception() -> None:
+    body = publisher.build_pr_body(
+        repo_full_name=SANDBOX,
+        issue_number=1,
+        patch_sha256=HASH,
+        diff=DIFF,
+        skipped_summary="- `pytest`: skipped (no container isolation available)",
+        exception_authorized_by="manyashre",
+        exception_reason=EXCEPTION_REASON,
+        issue_verified=True,
+    )
+    assert "No checks were executed" in body
+    assert "no container isolation available" in body
+
+
+def test_body_says_no_checks_executed_when_only_skips_exist() -> None:
+    """Skips with no exception still must not look like evidence."""
+    body = publisher.build_pr_body(
+        repo_full_name=SANDBOX,
+        issue_number=1,
+        patch_sha256=HASH,
+        diff=DIFF,
+        skipped_summary="- `pytest`: skipped (no container isolation available)",
+        issue_verified=True,
+    )
+    assert "No checks were executed" in body
+    assert "passed" not in body.lower()
+
+
+def test_plan_reports_the_exception_from_storage(conn) -> None:
+    """A recorded exception must surface on the plan and in the body."""
+    digest = compute_patch_sha256(DIFF)
+    seed_to_validating(conn, number=1)
+    storage.record_patch(
+        conn,
+        PatchRecord(
+            repo_full_name=SANDBOX,
+            issue_number=1,
+            provider="mock",
+            patch_sha256=digest,
+            diff=DIFF,
+        ),
+    )
+    # No passed checks: record the real skipped evidence the validator produces.
+    storage.record_validation_report(
+        conn,
+        ValidationReport(
+            repo_full_name=SANDBOX,
+            issue_number=1,
+            patch_sha256=digest,
+            isolated=False,
+            checks=[
+                ValidationCheck(
+                    kind=CheckKind.TESTS,
+                    name="pytest",
+                    command=["python", "-m", "pytest"],
+                    status=CheckStatus.SKIPPED,
+                    skip_reason="no container isolation available",
+                )
+            ],
+        ),
+    )
+    storage.record_validation_exception(
+        conn,
+        SANDBOX,
+        1,
+        patch_sha256=digest,
+        authorized_by="manyashre",
+        reason=EXCEPTION_REASON,
+    )
+    approval.apply_action(
+        conn, SANDBOX, 1, ApprovalAction.APPROVE, actor="manyashre", target_branch=BRANCH
+    )
+
+    plan = publisher.plan_publish(conn, SANDBOX, 1, target_branch=BRANCH)
+    assert plan.exception_authorized_by == "manyashre"
+    assert plan.exception_reason == EXCEPTION_REASON
+    assert "No checks were executed" in plan.body
+    assert EXCEPTION_REASON in plan.body
+    assert "`pytest`: passed" not in plan.body
+
+
+def test_plan_has_no_exception_when_checks_passed(conn) -> None:
+    seed_ready(conn)
+    plan = publisher.plan_publish(conn, SANDBOX, 7, target_branch=BRANCH)
+    assert plan.exception_authorized_by == ""
+    assert plan.exception_reason == ""
+    assert "No checks were executed" not in plan.body
