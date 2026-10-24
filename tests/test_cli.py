@@ -278,3 +278,34 @@ def test_shortlist_command_with_bad_reference_fails(tmp_path) -> None:
     result = runner.invoke(app, ["shortlist", "not-a-reference", "--db", str(tmp_path / "x.db")])
     assert result.exit_code == 1
     assert "invalid issue reference" in result.output
+
+
+def test_publish_without_a_token_reports_one_clean_line(tmp_path, monkeypatch) -> None:
+    """A real publish with no token must fail with a message, not a traceback.
+
+    This is the first thing an operator hits when they forget the publishing
+    credential, so it has to read as a sentence rather than a stack dump.
+    """
+    monkeypatch.delenv("FORGEFLOW_PUBLISH_TOKEN", raising=False)
+    config_file = tmp_path / "repos.yaml"
+    config_file.write_text(
+        "repositories:\n  - manyashre1306-glitch/forgeflow-sandbox\n", encoding="utf-8"
+    )
+    result = runner.invoke(
+        app,
+        [
+            "publish",
+            "manyashre1306-glitch/forgeflow-sandbox#1",
+            "--config",
+            str(config_file),
+            "--db",
+            str(tmp_path / "x.db"),
+            "--target-branch",
+            "main",
+            "--confirm-real-publish",
+        ],
+    )
+    assert result.exit_code == 1
+    assert "FORGEFLOW_PUBLISH_TOKEN is not set" in result.output
+    assert "Traceback" not in result.output
+    assert "PublishTokenError" not in result.output

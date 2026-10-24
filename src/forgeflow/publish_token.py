@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import os
 
+from forgeflow.errors import ForgeFlowError
+
 PUBLISH_TOKEN_ENV = "FORGEFLOW_PUBLISH_TOKEN"
 
 # Modules permitted to import this module. Enforced by a test, not by trust.
@@ -31,10 +33,12 @@ ALLOWED_IMPORTERS: frozenset[str] = frozenset(
 )
 
 
-class PublishTokenError(RuntimeError):
+class PublishTokenError(ForgeFlowError):
     """Raised when the publishing credential is missing or unusable.
 
-    The message never contains the token or any part of it.
+    Subclasses ForgeFlowError so the CLI reports it as a clean one-line error
+    rather than an unhandled traceback. The message never contains the token or
+    any part of it.
     """
 
 

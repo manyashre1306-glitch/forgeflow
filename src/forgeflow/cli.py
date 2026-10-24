@@ -32,6 +32,7 @@ from forgeflow.config import (
 )
 from forgeflow.dedupe import DroppedIssue, deduplicate, filter_issues
 from forgeflow.discovery import DiscoveryResult, collect_linked_open_prs, discover_issues
+from forgeflow.errors import ForgeFlowError
 from forgeflow.github_client import GitHubClient, GitHubError, GitHubReader, MissingTokenError
 from forgeflow.issue_analyzer import (
     AnalyzerError,
@@ -81,10 +82,6 @@ app = typer.Typer(
     add_completion=False,
 )
 console = Console()
-
-
-class ForgeFlowError(RuntimeError):
-    """A user-facing failure. The CLI prints the message and exits non-zero."""
 
 
 # --- shared helpers ---------------------------------------------------------
@@ -1170,7 +1167,7 @@ def publish(
             client=client,
             actor=actor,
         )
-    except PublisherError as exc:
+    except (PublisherError, ForgeFlowError) as exc:
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 

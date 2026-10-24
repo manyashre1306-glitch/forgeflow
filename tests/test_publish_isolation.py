@@ -143,3 +143,28 @@ def test_publish_token_error_message_contains_no_token(monkeypatch) -> None:
     with pytest.raises(publish_token.PublishTokenError) as excinfo:
         publish_token.read_publish_token()
     assert "ghp_" not in str(excinfo.value)
+
+
+# ==========================================================================
+# A missing token must be reported, not dumped as a traceback
+# ==========================================================================
+
+
+def test_publish_token_error_is_a_forgeflow_error() -> None:
+    """The CLI catches ForgeFlowError, so the token error must be one.
+
+    It was a plain RuntimeError before, which meant a missing token escaped the
+    handler and printed a raw traceback instead of the message.
+    """
+    from forgeflow.cli import ForgeFlowError
+
+    assert issubclass(publish_token.PublishTokenError, ForgeFlowError)
+    assert issubclass(publish_token.PublishTokenError, RuntimeError)
+
+
+def test_missing_token_error_is_caught_by_the_cli_handler() -> None:
+    """Raising the error through the CLI's handler yields a clean message."""
+    from forgeflow.cli import ForgeFlowError
+
+    error = publish_token.PublishTokenError("FORGEFLOW_PUBLISH_TOKEN is not set")
+    assert isinstance(error, ForgeFlowError)
