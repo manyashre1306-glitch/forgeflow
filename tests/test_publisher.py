@@ -1470,3 +1470,139 @@ def test_plan_has_no_exception_when_checks_passed(conn) -> None:
     assert plan.exception_authorized_by == ""
     assert plan.exception_reason == ""
     assert "No checks were executed" not in plan.body
+
+
+# ==========================================================================
+# AI-use policy: a detected restriction blocks publishing
+# ==========================================================================
+
+
+def _restrict_ai(conn, repo: str = SANDBOX, number: int = 7) -> None:
+    from forgeflow.models import AIPolicy, ContributionRules
+
+    storage.record_contribution_rules(
+        conn,
+        repo,
+        number,
+        ContributionRules(
+            ai_policy=AIPolicy.PROHIBITED,
+            ai_policy_evidence=["CONTRIBUTING.md: Do not generate PRs using AI."],
+            requires_ai_disclosure=True,
+        ),
+    )
+
+
+def test_ai_restriction_blocks_publishing(conn) -> None:
+    """A repository that prohibits AI contributions must refuse the publish."""
+    seed_ready(conn)
+    _restrict_ai(conn)
+    plan = publisher.plan_publish(conn, SANDBOX, 7, target_branch=BRANCH)
+    assert plan.refused is True
+    assert plan.ai_policy_restricted is True
+    assert "restricts AI-generated contributions" in plan.refusal_reason
+    assert any(name == "ai policy" and status == "FAIL" for name, status, _ in plan.checks)
+
+
+def test_ai_restriction_block_attempts_no_write(conn) -> None:
+    http = FakeHTTP()
+    seed_ready(conn)
+    _restrict_ai(conn)
+    with pytest.raises(RefusedByPolicyError):
+        publisher.publish(
+            conn,
+            SANDBOX,
+            7,
+            target_branch=BRANCH,
+            mode=PublishMode.REAL,
+            client=make_client(http),
+        )
+    assert http.writes == [], "a blocked publish must not reach the network"
+
+
+def test_ai_restriction_is_recorded_on_the_plan(conn) -> None:
+    seed_ready(conn)
+    _restrict_ai(conn)
+    plan = publisher.plan_publish(conn, SANDBOX, 7, target_branch=BRANCH)
+    assert plan.ai_policy == "prohibited"
+    assert plan.ai_policy_evidence
+
+
+def test_no_restriction_does_not_block(conn) -> None:
+    seed_ready(conn)  # no rules recorded at all
+    plan = publisher.plan_publish(conn, SANDBOX, 7, target_branch=BRANCH)
+    assert plan.refused is False
+    assert any(name == "ai policy" and status == "PASS" for name, status, _ in plan.checks)
+
+
+def test_documented_override_unblocks_publishing(conn) -> None:
+    seed_ready(conn)
+    _restrict_ai(conn)
+    storage.record_ai_policy_override(
+        conn,
+        SANDBOX,
+        7,
+        patch_sha256=HASH,
+        authorized_by="manyashre",
+        reason="I reviewed the policy and will disclose AI use in the PR.",
+    )
+    plan = publisher.plan_publish(conn, SANDBOX, 7, target_branch=BRANCH)
+    assert plan.refused is False
+    assert plan.ai_override_authorized_by == "manyashre"
+    assert "recorded AI-policy override" in plan.body
+
+
+def test_override_is_bound_to_the_patch_hash(conn) -> None:
+    """An override for one patch must not unlock a different patch."""
+    seed_ready(conn)
+    _restrict_ai(conn)
+    storage.record_ai_policy_override(
+        conn,
+        SANDBOX,
+        7,
+        patch_sha256="0" * 64,
+        authorized_by="manyashre",
+        reason="meant for another patch",
+    )
+    plan = publisher.plan_publish(conn, SANDBOX, 7, target_branch=BRANCH)
+    assert plan.refused is True
+
+
+def test_override_does_not_bypass_the_patch_integrity_check(conn) -> None:
+    """An override is not a master key: a tampered patch still blocks.
+
+    The approval-binding check fires first here (the diff no longer matches the
+    approved hash), which is exactly the point: the AI-policy override unlocks
+    only the AI-policy check, never the patch-integrity guards.
+    """
+    seed_ready(conn)
+    _restrict_ai(conn)
+    storage.record_ai_policy_override(
+        conn,
+        SANDBOX,
+        7,
+        patch_sha256=HASH,
+        authorized_by="manyashre",
+        reason="reviewed",
+    )
+    # Tamper with the stored diff so the hash no longer matches.
+    conn.execute("UPDATE patches SET diff = diff || '\n+evil\n' WHERE issue_number = 7")
+    conn.commit()
+    plan = publisher.plan_publish(conn, SANDBOX, 7, target_branch=BRANCH)
+    assert plan.refused is True
+    assert "patch changed since approval" in plan.refusal_reason
+
+
+def test_pr_body_states_the_restriction_when_overridden(conn) -> None:
+    seed_ready(conn)
+    _restrict_ai(conn)
+    storage.record_ai_policy_override(
+        conn,
+        SANDBOX,
+        7,
+        patch_sha256=HASH,
+        authorized_by="manyashre",
+        reason="reviewed",
+    )
+    plan = publisher.plan_publish(conn, SANDBOX, 7, target_branch=BRANCH)
+    assert "## Repository AI-use policy" in plan.body
+    assert "restricts AI-generated" in plan.body

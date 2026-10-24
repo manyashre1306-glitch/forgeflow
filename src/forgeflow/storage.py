@@ -18,6 +18,7 @@ from pathlib import Path
 
 from forgeflow.models import (
     AnalysisRecord,
+    ContributionRules,
     Issue,
     IssueScore,
     LLMUsage,
@@ -205,6 +206,30 @@ CREATE TABLE IF NOT EXISTS status_changes (
     changed_at     TEXT NOT NULL,
     actor          TEXT NOT NULL DEFAULT 'forgeflow',
     reason         TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY (repo_full_name, issue_number)
+        REFERENCES issues(repo_full_name, number)
+);
+
+CREATE TABLE IF NOT EXISTS contribution_rules (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at            TEXT NOT NULL,
+    repo_full_name        TEXT NOT NULL,
+    issue_number          INTEGER NOT NULL,
+    ai_policy             TEXT NOT NULL,
+    requires_ai_disclosure INTEGER NOT NULL DEFAULT 0,
+    payload_json          TEXT NOT NULL,
+    FOREIGN KEY (repo_full_name, issue_number)
+        REFERENCES issues(repo_full_name, number)
+);
+
+CREATE TABLE IF NOT EXISTS ai_policy_overrides (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at     TEXT NOT NULL,
+    repo_full_name TEXT NOT NULL,
+    issue_number   INTEGER NOT NULL,
+    patch_sha256   TEXT NOT NULL,
+    authorized_by  TEXT NOT NULL,
+    reason         TEXT NOT NULL,
     FOREIGN KEY (repo_full_name, issue_number)
         REFERENCES issues(repo_full_name, number)
 );
@@ -1052,6 +1077,120 @@ def validation_exception_for_patch(
         (repo_full_name, issue_number, patch_sha256),
     ).fetchone()
     return dict(row) if row else None
+
+
+def record_contribution_rules(
+    conn: sqlite3.Connection,
+    repo_full_name: str,
+    issue_number: int,
+    rules: ContributionRules,
+) -> int:
+    """Persist the detected contribution rules so a later review can read them."""
+    cursor = conn.execute(
+        """
+        INSERT INTO contribution_rules (
+            created_at, repo_full_name, issue_number, ai_policy,
+            requires_ai_disclosure, payload_json
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            datetime.now(UTC).isoformat(),
+            repo_full_name,
+            issue_number,
+            rules.ai_policy.value,
+            int(rules.requires_ai_disclosure),
+            rules.model_dump_json(),
+        ),
+    )
+    conn.commit()
+    return int(cursor.lastrowid or 0)
+
+
+def latest_contribution_rules(
+    conn: sqlite3.Connection,
+    repo_full_name: str,
+    issue_number: int,
+) -> ContributionRules | None:
+    """Return the most recent stored rules for one issue, or None.
+
+    A payload that no longer validates returns None rather than raising, so an
+    old row written before a schema change cannot break a review.
+    """
+    row = conn.execute(
+        """
+        SELECT payload_json FROM contribution_rules
+        WHERE repo_full_name = ? AND issue_number = ?
+        ORDER BY id DESC LIMIT 1
+        """,
+        (repo_full_name, issue_number),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        return ContributionRules.model_validate_json(row["payload_json"])
+    except Exception:
+        return None
+
+
+def record_ai_policy_override(
+    conn: sqlite3.Connection,
+    repo_full_name: str,
+    issue_number: int,
+    *,
+    patch_sha256: str,
+    authorized_by: str,
+    reason: str,
+) -> int:
+    """Record a documented override of a detected AI-use restriction.
+
+    Bound to the exact patch hash, so a new patch needs a new override.
+    """
+    cursor = conn.execute(
+        """
+        INSERT INTO ai_policy_overrides (
+            created_at, repo_full_name, issue_number, patch_sha256,
+            authorized_by, reason
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            datetime.now(UTC).isoformat(),
+            repo_full_name,
+            issue_number,
+            patch_sha256,
+            authorized_by,
+            reason,
+        ),
+    )
+    conn.commit()
+    return int(cursor.lastrowid or 0)
+
+
+def ai_policy_override_for_patch(
+    conn: sqlite3.Connection,
+    repo_full_name: str,
+    issue_number: int,
+    patch_sha256: str,
+) -> dict[str, object] | None:
+    """Return the recorded AI-policy override for this exact patch, or None."""
+    row = conn.execute(
+        """
+        SELECT * FROM ai_policy_overrides
+        WHERE repo_full_name = ? AND issue_number = ? AND patch_sha256 = ?
+        ORDER BY id DESC LIMIT 1
+        """,
+        (repo_full_name, issue_number, patch_sha256),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def ai_policy_is_restricted(rules: ContributionRules | None) -> bool:
+    """Whether detected rules constrain AI use. None (no context) is not a block.
+
+    Only a positive detection blocks publishing. Absent context is handled by the
+    publish path's own checks; this helper must not turn "we never looked" into a
+    silent pass, so callers that need that distinction should check for None.
+    """
+    return rules is not None and rules.is_ai_restricted
 
 
 def _row_to_analysis(row: sqlite3.Row) -> AnalysisRecord:
