@@ -201,3 +201,34 @@ Gates: 959 tests pass, ruff check and format clean. New test files:
 `tests/test_ai_policy_override_cli.py`; additions to
 `tests/test_repository_context.py`, `tests/test_pipeline_phase2.py`,
 `tests/test_publisher.py`.
+
+## Windows portability (2026-10-24)
+
+Branch `feat/windows-portability`. Four tests in `tests/test_repository_context.py`
+failed on Windows. Two distinct causes, both fixed without changing Linux
+behavior:
+
+1. **Paths used `str(Path)`, which yields backslashes on Windows.** The stored
+   excerpt path was compared against issue text that is always POSIX, so an
+   explicit path like `widget/parser.py` never matched. Fixed with `as_posix()`
+   in `select_relevant_files` (the excerpt path) and `detect_test_layout`
+   (the test-layout entries). `patch.py` needed no change: its paths come from
+   `git ls-files` / `git status --porcelain`, which already emit forward slashes.
+2. **`shutil.rmtree` fails on Windows when the tree holds read-only files**, and
+   a `git clone` leaves `.git/objects` read-only. Added `remove_tree()` in
+   `repository_context.py`, which passes `onexc=_force_writable_and_retry`. The
+   handler preserves the existing mode, adds the write bit, and adds the execute
+   bits for a directory (without them the retry cannot descend). All three
+   `shutil.rmtree` call sites in the module now use `remove_tree`:
+   `shallow_clone`, `remove_workspace` (which `cleanup_workspace` delegates to),
+   and `prune_workspaces`.
+
+`onexc` requires Python >= 3.12; the project requires >= 3.13, so it is safe.
+
+Gates: 965 tests pass, ruff check and format clean. New tests cover the
+forward-slash contract, a read-only tree, the handler on a file and on a
+directory, and `remove_workspace` on a read-only workspace.
+
+Note: the four Windows failures cannot be reproduced on Linux, so the fix is
+verified by the POSIX behavior staying identical plus tests that exercise the
+handler directly.
