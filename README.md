@@ -1,17 +1,33 @@
 # ForgeFlow
 
-An AI-powered open-source contribution automation platform. ForgeFlow finds
-suitable GitHub issues, analyzes them, plans fixes, implements them with a coding
-agent, runs tests and quality checks, and prepares pull requests for **explicit
-human approval**.
+ForgeFlow is a local-first, human-in-the-loop assistant for contributing to open
+source. It finds suitable GitHub issues, ranks them, analyses the strongest
+candidates with an LLM, drives a coding agent to implement a fix in isolation,
+runs the target repository's own quality checks, and prepares a draft pull
+request for **explicit human approval**. It never auto-merges, never force-pushes,
+and never writes to GitHub without a recorded approval bound to the exact patch.
 
-**Phases 1 and 2 are read-only.** Nothing in this project writes to GitHub: no
-pull requests, comments, branches, or issue edits. Phase 1 discovers issues from
-a configurable allowlist, deduplicates them, ranks them with deterministic
-heuristics, stores everything in SQLite, and writes a Markdown report. Phase 2
-extracts repository context, analyses an issue with an LLM, drives a coding agent
-behind a provider interface, captures the resulting patch with a SHA-256 hash,
-and writes a local review bundle.
+## Why it exists
+
+Contributing to open source is repetitive work wrapped around the part that
+actually matters: deciding what to work on and reviewing the change. ForgeFlow
+automates the repetitive part — discovery, triage, context gathering, a first
+implementation, and a review bundle — while keeping a human in control of every
+consequential action.
+
+Two design commitments follow from that, and they shape the whole codebase:
+
+1. **Honesty over polish.** A check that could not run is recorded as `skipped`,
+   never as `passed`. A metric with no data says "not enough data" rather than
+   `0.0`. A benchmark that was not run is not claimed.
+2. **Fail closed.** Missing credentials, missing container isolation, a changed
+   patch, or an over-budget month all stop the run rather than falling back to a
+   less safe path.
+
+This project is also built as a portfolio piece: the architecture, threat model,
+cost controls, evaluation methodology, and this README are first-class
+deliverables, not afterthoughts. Every claim here is backed by code, a test, or a
+command you can re-run.
 
 ## Status
 
@@ -21,29 +37,95 @@ and writes a local review bundle.
 | 2 | Repo context, agent adapter, analysis, sandbox, patch + review | Complete, with a documented limitation |
 | 3 | Validation, task states, security checks, approval-boundary tests | Complete |
 | 4 | Controlled publishing (draft PRs), feedback tracking, discovery-only scheduling | Complete, with a documented limitation |
-| 5 | Documentation, threat model, evaluation, portfolio README | Not started |
+| 5 | Documentation, architecture, threat model, evaluation, demo, portfolio README | In progress |
 
-**Phase 4 real run.** Publishing was exercised end to end once, against the
-sandbox repository on the publish allowlist: draft PR
-[`manyashre1306-glitch/forgeflow-sandbox#2`](https://github.com/manyashre1306-glitch/forgeflow-sandbox/pull/2).
-Its state is tracked with `forgeflow track`, which records it as **open** and
-**draft** (not merged). No other repository has been written to.
+Phase 5 adds documentation, the architecture diagram, the threat model, the
+evaluation harness and results, an offline dry-run demo, read-only CI, and this
+README. It adds **no new external write** and **no new credential**.
 
-**Phase 2 limitation, stated plainly.** ForgeFlow cannot run a real coding agent
-end-to-end in the development environment used so far, for two independent
-reasons: no `JULES_API_KEY` is present (and Jules keys can only be minted in the
-Jules web app), and no container runtime is available (the Docker client is
-installed but the daemon is not running, and `podman` is absent). Rather than
-pretend, the code fails closed: `analyze` refuses to call a model without
-`GEMINI_API_KEY`, and the sandbox refuses to execute untrusted repository code
-with no isolation. See `docs/phase2-notes.md` for the measured evidence and an
-explicit list of what could not be tested.
+## Architecture
+
+The full diagram, the task state machine, the data model, and the module
+responsibilities are in [`docs/architecture.md`](docs/architecture.md). The short
+version:
+
+```mermaid
+flowchart LR
+    CLI["forgeflow CLI"] --> DISC["discovery<br/>read-only search"]
+    CLI --> RANK["ranking<br/>six factors"]
+    CLI --> CTX["repository_context<br/>shallow clone"]
+    CLI --> ANA["issue_analyzer<br/>LLM, validated JSON"]
+    CLI --> VAL["validation<br/>tests / lint / types"]
+    CLI --> APPR["approval<br/>human boundary"]
+    CLI --> PUB["publisher<br/>gated draft PR"]
+
+    DISC --> DB[(SQLite)]
+    RANK --> DB
+    ANA --> DB
+    VAL --> DB
+    APPR --> DB
+    PUB --> DB
+
+    DISC --> GH[(GitHub API)]
+    CTX --> GH
+    PUB -- "draft PR only" --> GH
+
+    ANA -. "needs GEMINI_API_KEY" .-> LLM[["Model provider"]]
+    VAL -. "needs a container runtime" .-> SBX[["sandbox.py"]]
+
+    RCRED["GITHUB_TOKEN<br/>(read-only)"] -.-> DISC
+    WCRED["FORGEFLOW_PUBLISH_TOKEN<br/>(separate)"] -.-> PUB
+```
+
+The read path and the write path use **different credentials on purpose**. Only
+`publisher.py` uses the write token, and it never falls back to the read token.
+
+## Safety design
+
+ForgeFlow's only external write is opening a **draft** pull request. Everything
+below exists to make that one action safe and auditable. The full analysis,
+including residual risks, is in [`docs/threat-model.md`](docs/threat-model.md).
+
+- **Approval boundary.** Publishing requires a recorded human approval. Discovery
+  and the coding agent hold no publishing credential, and the `CodingAgent`
+  protocol exposes `run_task` and nothing else — there is no `publish`, `push`, or
+  token method for a prompt injection or a bug to reach.
+- **Patch-hash binding.** An approval is bound to the **SHA-256 of the exact diff
+  bytes**, the repository, and the target branch. If the patch changes after
+  approval, the hash no longer matches and publishing refuses. There is no force
+  flag.
+- **Validation gate.** A failed or errored check blocks publishing. The only way
+  past a failure is a documented `validation-exception` that names that exact
+  patch hash. A report that ran no checks (for example, no container runtime) is
+  never treated as a pass.
+- **Sandbox refusal.** Untrusted repository code runs only inside a container with
+  CPU, memory, time, and network limits. With no container runtime, `sandbox.py`
+  refuses to execute at all — there is deliberately **no host-execution fallback**,
+  and the check is recorded `skipped` with the real reason.
+- **Kill switch.** Three independent sources — `kill_switch: true` in config,
+  `FORGEFLOW_KILL_SWITCH=1` in the environment, or `forgeflow kill-switch on` in
+  SQLite — each halt all model calls and sandbox execution. It is checked before
+  the budget check and before the isolation check.
+- **Budgets.** `check_budget()` runs before every paid model call and raises once
+  the month's recorded spend reaches the cap; with no budget query wired in, it
+  refuses to call rather than assume zero spend. `TaskGuard` adds per-task time,
+  token, and cost ceilings. See [`docs/cost-controls.md`](docs/cost-controls.md).
+- **Separate publish token.** `FORGEFLOW_PUBLISH_TOKEN` is a distinct credential
+  with write scope, used only by the publishing path. It never falls back to
+  `GITHUB_TOKEN`, and a missing token fails closed with one clean line, never a
+  traceback.
+- **Allowlist.** `PUBLISH_ALLOWLIST` in `publisher.py` names the only repository
+  ForgeFlow may write to. Anything else is refused before any client is built.
+- **Draft only, no force, no merge.** The PR is opened as a draft. ForgeFlow never
+  auto-merges and never force-pushes.
 
 ## Requirements
 
 - Python 3.13 or newer
 - [uv](https://docs.astral.sh/uv/) for dependency management
-- A GitHub token (read-only is enough) for live discovery
+- git, for the shallow clone that context extraction uses
+- A GitHub token (read-only is enough) for live discovery — optional; everything
+  offline works without one
 
 ## Setup
 
@@ -53,247 +135,199 @@ cd forgeflow
 uv sync
 ```
 
-Copy the example environment file and add a token:
+Copy the example environment file and add only what you need:
 
 ```bash
 cp .env.example .env
-# then edit .env and set GITHUB_TOKEN=...
+# then edit .env and set GITHUB_TOKEN=... if you want live discovery
 ```
 
-ForgeFlow only needs public read access for discovery, ranking, analysis, and
-outcome tracking. A classic token with no scopes, or a fine-grained token with
-public read-only access, is sufficient. **Publishing is the only write path** and
-uses a separate `FORGEFLOW_PUBLISH_TOKEN` (see "Publishing"). Tokens are read
-from the environment (or `.env`) and are never printed or logged.
-
-Common commands are wrapped in a Makefile (`make help` lists them):
-
-```bash
-make setup      # uv sync
-make check      # lint, format check, and the full test suite
-make test       # just the tests
-make eval       # the offline evaluation harness
-make demo       # the offline dry-run end-to-end demonstration
-```
-
-`make demo` runs the whole pipeline offline, from a discovered issue to a publish
-that is planned in full and then not performed. It makes no network call and
-writes nothing. See `docs/demonstration.md`.
-
-See `docs/setup.md` for a full walkthrough and `Makefile` for every target.
-
-Edit `config/repositories.yaml` to change the repository allowlist, the ranking
-weights, and the skill keywords. Nothing outside the allowlist is ever queried.
+`.env` is gitignored, and `.env.example` ships every value empty on purpose. The
+full walkthrough is in [`docs/setup.md`](docs/setup.md).
 
 ## Usage
 
+Discovery, ranking, and reports (read-only):
+
 ```bash
-# 1. Discover open issues from the allowlist and store them.
-uv run forgeflow discover
-
-# 2. Rank the stored issues with the six weighted factors.
-uv run forgeflow rank --top 10
-
-# 3. Write a Markdown report to data/reports/.
-uv run forgeflow report
-
-# 4. Shortlist an issue you want to work on.
+uv run forgeflow discover              # find open issues from the allowlist
+uv run forgeflow rank --top 10         # rank with the six weighted factors
+uv run forgeflow report                # write a Markdown report to data/reports/
 uv run forgeflow shortlist pydantic/pydantic#1234 --reason "clear bug, good scope"
 ```
 
-Phase 2 commands:
+Context, analysis, implementation, review (Phase 2):
 
 ```bash
-# Extract repository context (shallow clone into data/workspaces/).
-uv run forgeflow context pydantic/pydantic#1234
-
-# Analyse the issue, then move it to awaiting_plan_approval.
-# Needs GEMINI_API_KEY; refuses to run without it.
-uv run forgeflow analyze pydantic/pydantic#1234
-
-# Run a coding agent on the approved plan and record a hashed patch.
-# Refuses unless the task is at awaiting_plan_approval.
+uv run forgeflow context pydantic/pydantic#1234      # shallow clone + context bundle
+uv run forgeflow analyze pydantic/pydantic#1234      # needs GEMINI_API_KEY; fails closed
 uv run forgeflow implement pydantic/pydantic#1234 --plan "the approved plan"
-
-# Write a local review bundle under data/reports/.
-# Loads the stored analysis and the latest patch automatically.
-uv run forgeflow review pydantic/pydantic#1234
+uv run forgeflow review pydantic/pydantic#1234       # local review bundle
 ```
 
-Manage cloned workspaces (clones are large and disposable):
+Validation and approval (Phase 3):
 
 ```bash
-uv run forgeflow workspace list
-uv run forgeflow workspace prune --keep 5 --dry-run
-uv run forgeflow workspace remove --issue pydantic/pydantic#1234
+uv run forgeflow validate pydantic/pydantic#1234
+uv run forgeflow approve pydantic/pydantic#1234 --reason "looks correct"
+uv run forgeflow request-changes pydantic/pydantic#1234 --reason "..."
+uv run forgeflow reject pydantic/pydantic#1234 --reason "..."
 ```
 
-Emergency stop. Either of these halts all model calls and sandbox execution:
+Publishing (Phase 4) — the only write path:
 
 ```bash
-FORGEFLOW_KILL_SWITCH=1 uv run forgeflow analyze pydantic/pydantic#1234
-# or set kill_switch: true in config/repositories.yaml
-```
-
-`implement --provider mock` uses the deterministic in-process agent, which needs
-no credentials. `--provider jules` additionally requires `--allow-external`, and
-fails closed without `JULES_API_KEY`.
-
-Useful options:
-
-```bash
-uv run forgeflow discover --limit 50 --no-linked-prs
-uv run forgeflow discover --db data/forgeflow.db --config config/repositories.yaml
-uv run forgeflow report --output data/reports/my-report.md
-```
-
-Run `uv run forgeflow --help` for the full list.
-
-## How ranking works
-
-Six factors from SPEC section 5, each scored 0.0 to 1.0 with a human-readable
-reason, combined into a weighted total on a 0 to 100 scale:
-
-| Factor | Default weight |
-| --- | ---: |
-| skill relevance | 25% |
-| issue clarity | 20% |
-| feasible scope | 20% |
-| testability | 15% |
-| repository health | 10% |
-| duplicate/conflict risk | 10% |
-
-Weights are configurable in `config/repositories.yaml` and must sum to 1.0.
-
-### Outcome-driven adjustment (off by default)
-
-SPEC section 11 asks tracked PR results to improve future ranking. ForgeFlow
-adds a **small, capped** adjustment on top of the weighted total, controlled by
-`outcome_ranking` in `config/repositories.yaml`:
-
-- It is **off by default** (`enabled: false`). With it off, ranking is exactly
-  the six factors above.
-- It can move an issue by at most `max_adjustment_points` (default 3.0 points on
-  the 0-100 scale), far less than any single factor's weight.
-- It rewards maintainer **engagement**, not contribution count. A merge weighs
-  most, an approval less, and a maintainer requesting changes still counts
-  positively, because that is a real signal the task was worth doing. A PR closed
-  with no engagement lowers the score slightly.
-- Only the most recent `lookback` outcomes per repository count.
-
-Track outcomes with `uv run forgeflow track <owner/repo#N>` and see the SPEC
-section 11 metrics with `uv run forgeflow metrics`. `time_saved_hours` is
-reported as 0.0 on purpose: it is not measured, and a constant estimate would be
-a fabricated benchmark.
-
-> **Caveat.** These scores are initial heuristics, **not proven predictors of PR
-> acceptance**. A high score means an issue matched the configured signals; it
-> does not mean the issue is suitable. Always check the issue's current state and
-> the repository's contribution instructions before starting work.
-
-## Publishing
-
-Publishing is the only part of ForgeFlow that writes to GitHub, and it is
-guarded. It needs a **separate** token, `FORGEFLOW_PUBLISH_TOKEN`, that never
-falls back to `GITHUB_TOKEN`; the read path and the write path use different
-credentials on purpose (SPEC sections 8 and 9).
-
-```bash
-# Preview what would be published. No write happens (dry run is the default).
+# Preview what would be published. This is a dry run; nothing is written.
 uv run forgeflow publish pydantic/pydantic#1234
 
-# Approve the latest patch, then publish for real. The approval binds to the
-# SHA-256 of that exact diff.
-uv run forgeflow approve pydantic/pydantic#1234 --reason "looks correct"
+# Publish for real. Needs FORGEFLOW_PUBLISH_TOKEN and a matching approval.
 uv run forgeflow publish pydantic/pydantic#1234 --confirm-real-publish
 ```
 
-What the real-mode publish does, in order, and how it fails:
+Run `uv run forgeflow --help` for the full command list.
 
-- **Approval.** It requires a recorded approval bound to the SHA-256 of the
-  exact diff. If the patch changed, the approval no longer matches and publishing
-  refuses. There is no force flag.
-- **Validation.** A failed or errored check blocks publishing unless a documented
-  `validation-exception` authorizes that exact patch hash.
-- **Issue verification.** It checks the issue exists using the **read-only**
-  client, never the publishing token. Only a verified issue lets the PR body
-  claim `Fixes #N`; an unverified reference (deleted, renamed, private, or a
-  denied read) is labelled unverified in the body instead of being asserted. A
-  closing keyword that points nowhere would be a false claim, so it is not made.
-- **Missing token.** A missing `FORGEFLOW_PUBLISH_TOKEN` fails closed with a
-  clean one-line error, never a traceback and never a fallback to `GITHUB_TOKEN`.
-- **Draft by default.** The PR is opened as a draft where the API supports it.
-  ForgeFlow never auto-merges and never force-pushes.
-
-## Scheduling (discovery only, off by default)
-
-SPEC section 13 says to add scheduling only after manual runs are reliable.
-ForgeFlow therefore ships an **optional, discovery-only** schedule:
+## Test command
 
 ```bash
-# Show the schedule state (disabled by default).
-uv run forgeflow schedule
-
-# Run one discovery cycle now, if it is due.
-uv run forgeflow schedule --run
+uv run python -m pytest -q
 ```
 
-Rules that make this safe:
+The suite is entirely offline: the GitHub client is injected, the LLM backend is
+replaced by a scripted fake, the coding agent by `MockAgent`, and repository
+clones come from a local fixture. It needs no `GITHUB_TOKEN`, no `GEMINI_API_KEY`,
+and no container runtime.
 
-- **Discovery only.** The scheduler can run exactly one command, `discover`.
-  There is no code path from the scheduler to publishing, validation, or a model
-  call, and a test asserts it imports neither the publisher nor the token module.
-- **Off by default.** Set `schedule.enabled: true` in `config/repositories.yaml`
-  to turn it on. Nothing runs on a timer until you do.
-- **No daemon.** There is no background thread or loop. A cycle runs only when a
-  caller invokes `forgeflow schedule --run` and the interval has elapsed, so
-  behaviour stays observable.
-- **Kill switch honoured.** An engaged kill switch refuses the cycle before any
-  GitHub client is built.
+## Make targets
 
-> **Turn scheduling on only after manual runs are reliable.** Run discovery,
-> ranking, analysis, validation, and publishing by hand until each is dependable,
-> then enable the schedule. Never schedule publishing: every external write needs
-> explicit human approval (SPEC section 8), which a timer cannot give.
+```bash
+make help       # list every target
+make setup      # uv sync
+make check      # lint + format check + the full test suite (same gates CI runs)
+make test       # just the tests
+make lint       # ruff check
+make format     # ruff format
+make discover   # uv run forgeflow discover
+make rank       # uv run forgeflow rank
+make report     # uv run forgeflow report
+make eval       # the offline evaluation harness (SPEC section 11)
+make demo       # the offline dry-run end-to-end demonstration
+make clean      # remove caches and the local database
+```
 
-## Data
+## Documentation
 
-- `data/forgeflow.db` — SQLite database (gitignored)
-- `data/reports/` — generated Markdown reports and review bundles (gitignored)
-- `data/workspaces/` — shallow repository clones (gitignored, disposable)
+| Document | What it covers |
+| --- | --- |
+| [`docs/architecture.md`](docs/architecture.md) | system diagram, task state machine, data model, module responsibilities |
+| [`docs/threat-model.md`](docs/threat-model.md) | the ten threats SPEC section 9 names, their mitigations, and residual risk |
+| [`docs/evaluation.md`](docs/evaluation.md) | SPEC section 11 metrics, how they are computed, and the results on fixtures |
+| [`docs/cost-controls.md`](docs/cost-controls.md) | budgets, caps, and how to verify current vendor pricing |
+| [`docs/setup.md`](docs/setup.md) | the full local walkthrough |
+| [`docs/demonstration.md`](docs/demonstration.md) | the offline dry-run demo and what it does not claim |
 
-SQLite needs no server. Delete the database file to start over.
+## Evaluation
+
+```bash
+uv run python -m evaluation
+```
+
+The harness builds an in-memory database from controlled fixtures, records real
+facts through ForgeFlow's own storage and outcome APIs, and prints the SPEC
+section 11 metrics. It performs no network access. A metric with no denominator
+prints **not enough data** rather than `0.0`, and `time_saved_hours` prints **not
+measured** because no human baseline is timed. Full methodology and results:
+[`docs/evaluation.md`](docs/evaluation.md).
+
+## Demonstration
+
+```bash
+uv run python -m demo
+```
+
+A single command runs the whole pipeline offline — discover, rank, context,
+analyze, implement, validate, record an exception, approve, then a **dry-run**
+publish — against a controlled fixture. It makes no network call and writes
+nothing; the final line is `Write requests attempted: 0`. Details and honest
+caveats: [`docs/demonstration.md`](docs/demonstration.md).
+
+## Honest limitations
+
+ForgeFlow is honest about what it has and has not done. These are stated here so
+no reader has to infer them:
+
+- **No container runtime in this environment.** The Docker client exists but the
+  daemon socket does not, and `podman` is absent. `sandbox.py` therefore refuses
+  to run repository code. There is no host-execution fallback.
+- **No model keys were used.** `GEMINI_API_KEY` and `JULES_API_KEY` are absent, so
+  `analyze` and `implement --provider jules` fail closed. The demonstration uses
+  the deterministic `MockAgent`, and the one real publish used a synthetic patch.
+- **Validation is recorded as skipped, not passed.** With no container runtime,
+  every repository check is `skipped`. The demonstration's publish is authorized
+  by a *documented exception*, and the PR body says so rather than implying a pass.
+- **No SWE-bench run.** SWE-bench needs a dataset, network access, and a container
+  runtime, none of which are present. In its place the harness runs three
+  deterministic, offline patch-application cases. No benchmark performance is
+  claimed.
+- **Metrics are fixture arithmetic.** They prove the metric code is correct and
+  that missing data is reported as missing; they are not a claim about real-world
+  acceptance rates.
+- **One real publish, in a sandbox.** See the Contributions section below. A rate
+  over one synthetic task would be noise presented as signal, so it is not folded
+  into a headline number.
+
+## Contributions
+
+This section lists only pull requests that actually exist. It is checked against
+the GitHub API, not recalled.
+
+| Repository | PR | Status | Notes |
+| --- | --- | --- | --- |
+| `manyashre1306-glitch/forgeflow-sandbox` (a repository owned by the author, used for end-to-end testing) | [#2 — Add a Notes section to the README](https://github.com/manyashre1306-glitch/forgeflow-sandbox/pull/2) | **open, draft, not merged** | Opened by ForgeFlow during the Phase 4 end-to-end run. Synthetic patch (produced by the mock agent). No reviews and no comments as of 2026-10-24. |
+| Upstream repositories | — | **none yet** | No pull request has been opened against any third-party repository. |
+
+ForgeFlow has not contributed to any repository it does not own. Nothing in this
+table is a benchmark result, an acceptance rate, or maintainer feedback, because
+none of those have been measured or received.
+
+## Roadmap
+
+Phase 5 (this phase) is in progress. Beyond it:
+
+- **Finish Phase 5.** Evaluation results, final demonstration write-up, and this
+  portfolio README are the remaining deliverables.
+- **Run a real coding agent end to end.** Requires a `JULES_API_KEY` (mintable
+  only in the Jules web app) or another provider behind the existing
+  `CodingAgent` adapter.
+- **Execute validation for real.** Requires a container runtime; the sandbox and
+  the validation pipeline are already built and will run unchanged once one is
+  available.
+- **An automated integration test against a repository the author owns.** The one
+  real publish was performed manually; automating it needs a write-scope token in
+  CI, which this project deliberately avoids today.
+- **A real benchmark run (SWE-bench or similar)** once a dataset, network access,
+  and a container runtime are available.
+- **Shorter-lived publishing credentials.** The publish token is currently a
+  static secret; least privilege is enforced by the allowlist and the separate
+  token, not by token lifetime.
+- **An external, append-only audit sink.** The append-only guarantee is currently
+  local to the SQLite file.
 
 ## Development
 
 ```bash
-# Lint
-uv run python -m ruff check .
-
-# Check formatting
-uv run python -m ruff format --check .
-
-# Run the test suite
-uv run python -m pytest -q
-
-# Apply formatting
-uv run python -m ruff format .
+uv run python -m ruff check .          # lint
+uv run python -m ruff format --check . # formatting check
+uv run python -m pytest -q             # tests
 ```
 
-Tests never touch the network. The GitHub client is injected, the LLM backend is
-replaced by a scripted fake, the coding agent by `MockAgent`, and repository
-clones come from a local fixture. The suite needs no `GITHUB_TOKEN`, no
-`GEMINI_API_KEY`, and no Docker.
+CI (`.github/workflows/ci.yml`) runs exactly these three gates, needs no secrets,
+and requests `contents: read`.
 
 ## Project layout
 
 ```
 src/forgeflow/
-  cli.py                 Typer commands: discover, schedule, rank, report,
-                         shortlist, context, analyze, implement, review,
-                         workspace, kill-switch, audit-log, track, metrics,
-                         approve, request-changes, reject, discard, validate,
-                         validation-exception, publish
+  cli.py                 Typer commands for every phase
   config.py              allowlist, weights, LLM config; secrets from env only
   models.py              Pydantic models, state machine, untrusted-text model
   github_client.py       the only module that performs GitHub HTTP; read-only
@@ -323,11 +357,8 @@ src/forgeflow/
 evaluation/              SPEC section 11 metrics harness (offline fixtures)
 demo/                    offline dry-run end-to-end demonstration (no writes)
 config/repositories.yaml   allowlist, weights, skill keywords, LLM settings
-docs/SPEC.md               the project specification
-docs/agent-evaluation.md   verified Jules and Gemini CLI capabilities
-docs/phase2-notes.md       Phase 2 limitations and untested items
-docs/threat-model.md       threats and mitigations, including the publish path
-docs/demonstration.md      what the dry-run demo shows, and what it does not
+docs/                      SPEC, architecture, threat model, evaluation,
+                           cost controls, setup, demonstration
 ```
 
 ## License
