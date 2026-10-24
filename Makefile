@@ -4,7 +4,7 @@
 # Run `make` or `make help` to list the targets.
 
 .DEFAULT_GOAL := help
-.PHONY: help setup test lint format check discover rank report eval clean
+.PHONY: help setup test lint format check discover rank report eval demo clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -38,6 +38,9 @@ report: ## Write a Markdown report of ranked and excluded issues
 
 eval: ## Run the SPEC section 11 evaluation harness (offline)
 	uv run python -m evaluation
+
+demo: ## Run the offline dry-run end-to-end demonstration (no network, no writes)
+	uv run python -m demo
 
 clean: ## Remove local caches and the local database
 	rm -rf .pytest_cache .ruff_cache

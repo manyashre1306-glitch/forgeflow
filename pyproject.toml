@@ -33,7 +33,7 @@ packages = ["src/forgeflow"]
 [tool.ruff]
 line-length = 100
 target-version = "py313"
-src = ["src", "tests", "evaluation"]
+src = ["src", "tests", "evaluation", "demo"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "C4", "RUF"]

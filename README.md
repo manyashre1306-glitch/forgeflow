@@ -73,7 +73,12 @@ make setup      # uv sync
 make check      # lint, format check, and the full test suite
 make test       # just the tests
 make eval       # the offline evaluation harness
+make demo       # the offline dry-run end-to-end demonstration
 ```
+
+`make demo` runs the whole pipeline offline, from a discovered issue to a publish
+that is planned in full and then not performed. It makes no network call and
+writes nothing. See `docs/demonstration.md`.
 
 See `docs/setup.md` for a full walkthrough and `Makefile` for every target.
 
@@ -315,11 +320,14 @@ src/forgeflow/
   audit.py               append-only audit log
   killswitch.py          persistent kill switch and per-task guardrails
   security.py            secret scrubbing for recorded output
+evaluation/              SPEC section 11 metrics harness (offline fixtures)
+demo/                    offline dry-run end-to-end demonstration (no writes)
 config/repositories.yaml   allowlist, weights, skill keywords, LLM settings
 docs/SPEC.md               the project specification
 docs/agent-evaluation.md   verified Jules and Gemini CLI capabilities
 docs/phase2-notes.md       Phase 2 limitations and untested items
 docs/threat-model.md       threats and mitigations, including the publish path
+docs/demonstration.md      what the dry-run demo shows, and what it does not
 ```
 
 ## License
