@@ -75,6 +75,7 @@ class FakeHTTP:
         pr_response: dict | None = None,
         base_files: dict[str, str] | None = None,
         existing_branches: list[str] | None = None,
+        existing_issues: list[str] | None = None,
     ) -> None:
         self.branch_sha = branch_sha
         self.write_scope = write_scope
@@ -86,6 +87,8 @@ class FakeHTTP:
         # Files on the base branch, readable through the contents endpoint.
         self.base_files = base_files if base_files is not None else {"p.py": "def f():\n"}
         self.existing_branches = existing_branches if existing_branches is not None else [BRANCH]
+        # Issue numbers that exist. Defaults to "7", the seeded issue.
+        self.existing_issues = existing_issues if existing_issues is not None else ["7"]
         self.gets: list[str] = []
         self.posts: list[tuple[str, dict]] = []
         self.created_refs: list[str] = []
@@ -101,6 +104,11 @@ class FakeHTTP:
 
             encoded = base64.b64encode(self.base_files[path].encode()).decode()
             return FakeResponse(200, {"content": encoded, "encoding": "base64"})
+        if "/issues/" in url:
+            number = url.rstrip("/").split("/")[-1]
+            if number in self.existing_issues:
+                return FakeResponse(200, {"number": int(number)})
+            return FakeResponse(404, {"message": "Not Found"})
         if "/git/ref/heads/" in url:
             return FakeResponse(200, {"object": {"sha": self.branch_sha}})
         if url.endswith("/branches?per_page=100") or "/branches?" in url:
@@ -634,6 +642,7 @@ def test_write_client_exposes_exactly_one_write_method() -> None:
         "get_file_content",
         "get_ref_sha",
         "has_write_scope",
+        "issue_exists",
         "list_branches",
     }
     writes = [
@@ -1151,3 +1160,130 @@ def test_pr_body_states_it_is_not_auto_merged(conn) -> None:
     seed_ready(conn)
     plan = publisher.plan_publish(conn, SANDBOX, 7, target_branch=BRANCH)
     assert "not auto-merged" in plan.body
+
+
+# ==========================================================================
+# The body must not overstate the evidence or the issue reference
+# ==========================================================================
+
+
+def test_body_discloses_missing_container_isolation() -> None:
+    """Evidence recorded without isolation must be labelled as weaker."""
+    body = publisher.build_pr_body(
+        repo_full_name=SANDBOX,
+        issue_number=7,
+        patch_sha256=HASH,
+        diff=DIFF,
+        test_summary="- `pytest`: passed (exit 0)",
+        evidence_isolated=False,
+        issue_verified=True,
+    )
+    assert "without container" in body
+    assert "weaker evidence" in body
+
+
+def test_body_states_when_evidence_was_isolated() -> None:
+    body = publisher.build_pr_body(
+        repo_full_name=SANDBOX,
+        issue_number=7,
+        patch_sha256=HASH,
+        diff=DIFF,
+        test_summary="- `pytest`: passed (exit 0)",
+        evidence_isolated=True,
+        issue_verified=True,
+    )
+    assert "isolated sandbox" in body
+    assert "weaker evidence" not in body
+
+
+def test_body_only_claims_fixes_when_the_issue_is_verified() -> None:
+    """'Fixes #N' is a closing keyword; it must not be claimed unverified."""
+    body = publisher.build_pr_body(
+        repo_full_name=SANDBOX,
+        issue_number=1,
+        patch_sha256=HASH,
+        diff=DIFF,
+        issue_verified=False,
+    )
+    assert not body.startswith("Fixes #1")
+    assert "could not be verified" in body
+
+
+def test_body_claims_fixes_when_the_issue_is_verified() -> None:
+    body = publisher.build_pr_body(
+        repo_full_name=SANDBOX,
+        issue_number=7,
+        patch_sha256=HASH,
+        diff=DIFF,
+        issue_verified=True,
+    )
+    assert body.startswith("Fixes #7")
+
+
+def test_plan_marks_evidence_unisolated_when_validation_was_not_isolated(conn) -> None:
+    """Evidence recorded without isolation must be reported as weaker.
+
+    This is the honest case for a host with no container runtime: the check ran,
+    but not in a sandbox, and the body must not imply otherwise.
+    """
+    digest = compute_patch_sha256(DIFF)
+    seed_to_validating(conn)
+    storage.record_patch(
+        conn,
+        PatchRecord(
+            repo_full_name=SANDBOX,
+            issue_number=7,
+            provider="mock",
+            patch_sha256=digest,
+            diff=DIFF,
+        ),
+    )
+    report = validation_report(SANDBOX, 7, digest)
+    report.isolated = False
+    storage.record_validation_report(conn, report)
+    approval.apply_action(conn, SANDBOX, 7, ApprovalAction.APPROVE, target_branch=BRANCH)
+
+    plan = publisher.plan_publish(conn, SANDBOX, 7, target_branch=BRANCH)
+    assert plan.evidence_isolated is False
+    assert "without container" in plan.body
+    assert "weaker evidence" in plan.body
+
+
+def test_plan_marks_evidence_isolated_when_validation_was_isolated(conn) -> None:
+    digest = compute_patch_sha256(DIFF)
+    seed_to_validating(conn)
+    storage.record_patch(
+        conn,
+        PatchRecord(
+            repo_full_name=SANDBOX,
+            issue_number=7,
+            provider="mock",
+            patch_sha256=digest,
+            diff=DIFF,
+        ),
+    )
+    report = validation_report(SANDBOX, 7, digest)
+    report.isolated = True
+    storage.record_validation_report(conn, report)
+    approval.apply_action(conn, SANDBOX, 7, ApprovalAction.APPROVE, target_branch=BRANCH)
+    plan = publisher.plan_publish(conn, SANDBOX, 7, target_branch=BRANCH)
+    assert plan.evidence_isolated is True
+    assert "isolated sandbox" in plan.body
+
+
+def test_plan_does_not_claim_fixes_for_a_missing_issue(conn) -> None:
+    """A client that 404s the issue means the body must not claim 'Fixes'."""
+    seed_ready(conn)
+    http = FakeHTTP(existing_issues=[])  # issue 7 does not exist
+    plan = publisher.plan_publish(conn, SANDBOX, 7, target_branch=BRANCH, client=make_client(http))
+    assert plan.issue_verified is False
+    assert not plan.body.startswith("Fixes #7")
+    assert "could not be verified" in plan.body
+
+
+def test_plan_claims_fixes_when_the_issue_exists(conn) -> None:
+    seed_ready(conn)
+    http = FakeHTTP(existing_issues=["7"])
+    plan = publisher.plan_publish(conn, SANDBOX, 7, target_branch=BRANCH, client=make_client(http))
+    assert plan.issue_verified is True
+    assert plan.body.startswith("Fixes #7")

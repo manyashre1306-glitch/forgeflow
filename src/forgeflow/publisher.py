@@ -93,6 +93,11 @@ class PublishPlan:
     refused: bool = False
     refusal_reason: str = ""
     unverified: list[str] = field(default_factory=list)
+    # Whether the recorded validation ran in a container, and whether the
+    # referenced issue was confirmed to exist. Both are shown in the body so a
+    # reviewer can weigh the claim.
+    evidence_isolated: bool = False
+    issue_verified: bool = False
 
     @property
     def allowed(self) -> bool:
@@ -188,6 +193,25 @@ def require_creatable_branch(branch: str, *, existing: list[str] | None = None) 
         )
 
 
+def _evidence_note(evidence_isolated: bool) -> str:
+    """One line stating how trustworthy the reported checks are.
+
+    This exists because a check that passed without container isolation proves
+    much less than one that passed inside a container. Reporting both the same
+    way would overstate the evidence to a maintainer.
+    """
+    if evidence_isolated:
+        return (
+            "Checks ran inside an isolated sandbox (container), so the results "
+            "reflect the patch rather than the host environment."
+        )
+    return (
+        "> **Note:** the checks below were recorded **without container "
+        "isolation**. They are reported as recorded, but they were not run in a "
+        "hermetic sandbox, so treat them as weaker evidence."
+    )
+
+
 def build_pr_body(
     *,
     repo_full_name: str,
@@ -197,20 +221,36 @@ def build_pr_body(
     analysis_summary: str = "",
     test_summary: str = "",
     limitations: list[str] | None = None,
+    evidence_isolated: bool = False,
+    issue_verified: bool = False,
 ) -> str:
     """Compose the PR body from recorded facts.
 
     Every line here comes from stored data. Nothing is invented: if a test
-    summary is absent, the body says so rather than claiming tests passed.
+    summary is absent, the body says so rather than claiming tests passed, and
+    the isolation status of the evidence is stated rather than implied.
+
+    ``issue_verified`` must be True before the body claims ``Fixes #N``. An
+    unverified reference is labelled as unverified, because a closing keyword
+    pointing at a non-existent issue is a false claim to a maintainer.
     """
+    if issue_verified:
+        opening = f"Fixes #{issue_number}"
+    else:
+        opening = (
+            f"References #{issue_number} (this issue reference could not be "
+            "verified to exist; treat it as unconfirmed)"
+        )
     parts = [
-        f"Fixes #{issue_number}",
+        opening,
         "",
         "## Summary",
         "",
         analysis_summary.strip() or "_No analysis summary was recorded for this task._",
         "",
         "## Validation",
+        "",
+        _evidence_note(evidence_isolated),
         "",
         test_summary.strip() or "_No test evidence was recorded for this patch._",
         "",
@@ -446,6 +486,13 @@ def plan_publish(
         unverified("target branch", f"{target_branch} could not be checked (dry run, no client)")
         unverified("permission scope", "token scope could not be checked (dry run, no client)")
 
+    # Computed once and stored on the plan as well as the body, so a caller can
+    # inspect the provenance of the claims without parsing the rendered text.
+    plan.evidence_isolated = _evidence_isolated(
+        conn, repo_full_name, issue_number, patch.patch_sha256
+    )
+    plan.issue_verified = _issue_verified(client, repo_full_name, issue_number)
+
     plan.body = build_pr_body(
         repo_full_name=repo_full_name,
         issue_number=issue_number,
@@ -454,8 +501,47 @@ def plan_publish(
         analysis_summary=_analysis_summary(conn, repo_full_name, issue_number),
         test_summary=_test_summary(conn, repo_full_name, issue_number, patch.patch_sha256),
         limitations=_limitations(conn, repo_full_name, issue_number, patch.patch_sha256),
+        evidence_isolated=plan.evidence_isolated,
+        issue_verified=plan.issue_verified,
     )
     return plan
+
+
+def _evidence_isolated(
+    conn: sqlite3.Connection,
+    repo_full_name: str,
+    issue_number: int,
+    patch_sha256: str,
+) -> bool:
+    """Whether the recorded evidence for this patch came from a sandbox.
+
+    The isolated column is written per check at record time. This reports True
+    only when a check actually ran isolated; a report recorded without isolation
+    is reported as such in the PR body.
+    """
+    rows = storage.list_validation_results(
+        conn, repo_full_name, issue_number, patch_sha256=patch_sha256
+    )
+    return any(bool(row.get("isolated")) for row in rows)
+
+
+def _issue_verified(
+    client: GitHubWriteClient | None,
+    repo_full_name: str,
+    issue_number: int,
+) -> bool:
+    """Whether the issue exists on GitHub, so 'Fixes #N' can be claimed.
+
+    With no client, or on any read failure, this returns False. An unverified
+    reference is labelled unverified rather than silently asserted, because a
+    closing keyword that points nowhere is a false claim.
+    """
+    if client is None:
+        return False
+    try:
+        return client.issue_exists(repo_full_name, issue_number)
+    except Exception:
+        return False
 
 
 def _analysis_summary(conn: sqlite3.Connection, repo_full_name: str, issue_number: int) -> str:
@@ -789,6 +875,14 @@ class GitHubWriteClient:
         if not isinstance(obj, dict) or not obj.get("sha"):
             raise PublisherError(f"branch {branch!r} has no commit")
         return str(obj["sha"])
+
+    def issue_exists(self, repo_full_name: str, issue_number: int) -> bool:
+        """Whether an issue or PR with this number exists. Read-only."""
+        try:
+            self._get(f"/repos/{repo_full_name}/issues/{issue_number}")
+        except PublisherError:
+            return False
+        return True
 
     def list_branches(self, repo_full_name: str) -> list[str]:
         """Every branch name on the repository. Used by the existence check."""
