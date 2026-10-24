@@ -92,3 +92,32 @@ Two changes on branch `feat/phase4-controlled-publishing`.
    - `metrics_report()` always returns every key in `SPEC_METRICS`.
 
 Current gate state: 863 tests pass, ruff check and format clean.
+
+## Phase 4 ranking adjustment and scheduler (2026-10-24)
+
+STEP 4.3 gap closed and STEP 4.4 added.
+
+- **Outcome ranking adjustment.** `OutcomeRankingConfig` in `config.py`, wired
+  through `ranking.outcome_adjustment()` and `ranking.adjusted_total()`. It is
+  **off by default** (`enabled: false`), capped at `max_adjustment_points`
+  (default 3.0 on the 0-100 scale), and rewards maintainer engagement, not merge
+  count: merges weigh most, approvals less, changes-requested still positive,
+  closed-unmerged negative. `outcome_tracker.outcome_stats_by_repo()` builds the
+  per-repository stats from the DB; `cli.run_rank`/`run_report` pass them only
+  when the config enables the adjustment. `RankedIssue.outcome_adjustment` is a
+  separate field; the base six-factor score is untouched.
+- **Scheduler (SPEC 13).** `scheduler.py`, `ScheduleConfig` (off by default).
+  Discovery **only**: `ALLOWED_SCHEDULED_COMMANDS == {"discover"}`, and a test
+  asserts the module imports neither the publisher nor the token module. No
+  daemon or loop; `forgeflow schedule [--run]` performs at most one cycle when
+  due. Kill switch is checked before any client is built. Publishing is never
+  scheduled (SPEC 8).
+- **Tests added.** `tests/test_ranking.py` (outcome adjustment),
+  `tests/test_outcome_tracker.py` (stats aggregation + lookback),
+  `tests/test_scheduler.py` (17 tests). `test_publish_isolation.py` now also
+  covers `outcome_tracker` and `scheduler`.
+- **Docs.** README gained "Publishing" and "Scheduling (discovery only, off by
+  default)" sections plus an outcome-adjustment note. `docs/threat-model.md`
+  gained threat 9 (gaming the outcome metric).
+
+Current gate state: 898 tests pass, ruff check and format clean.
