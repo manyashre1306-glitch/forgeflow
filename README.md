@@ -367,4 +367,4 @@ docs/                      SPEC, architecture, threat model, evaluation,
 
 ## License
 
-No license has been chosen yet.
+MIT. See the LICENSE file.
