@@ -13,6 +13,32 @@ key, a container runtime), the text says so.
 - **A GitHub token** (read-only) for live discovery. Optional: everything
   offline — tests, the evaluation harness — works without one.
 
+### Windows
+
+The core is portable to Windows. `uv sync`, the three gates, the evaluation
+harness, and the demo all run in PowerShell unchanged. A few notes:
+
+- **Use PowerShell or Windows Terminal, not `cmd.exe`.** The commands below use
+  `&&`, which `cmd.exe` does not understand. In PowerShell, `;` also works.
+- **Setting an environment variable differs.** Instead of
+  `VAR=value command`, use one of:
+
+  ```powershell
+  $env:FORGEFLOW_WEB_MODE = "local"     # this session only
+  $env:GITHUB_TOKEN = "..."             # this session only
+  ```
+
+  or set it persistently with `setx FORGEFLOW_WEB_MODE local` (a new shell is
+  needed for `setx` to take effect).
+- **The `.env` file still works.** `uv run` loads `.env` the same way on Windows,
+  so `cp .env.example .env` becomes `Copy-Item .env.example .env` and everything
+  else is unchanged.
+- **The website needs the extra on every platform:** `uv sync --extra web`.
+
+The context-extraction tests cover Windows path handling explicitly
+(`tests/test_repository_context.py`), because POSIX and Windows path separators
+differ and a bug there is silent.
+
 ## 2. Clone and sync
 
 ```bash
@@ -91,7 +117,30 @@ uv run forgeflow report
 The report is written under `data/reports/`. `data/` and `data/*.db` are
 gitignored.
 
-## 8. What will not run here, and why
+## 8. Run the website (optional)
+
+```bash
+uv sync --extra web
+uv run --extra web streamlit run web/app.py
+```
+
+The website defaults to **hosted** mode, where the database-backed and publishing
+pages are locked. For the full app on your own machine:
+
+```bash
+FORGEFLOW_WEB_MODE=local uv run --extra web streamlit run web/app.py
+```
+
+Windows (PowerShell):
+
+```powershell
+$env:FORGEFLOW_WEB_MODE = "local"
+uv run --extra web streamlit run web/app.py
+```
+
+Full run and deployment guide: [`deploy-website.md`](deploy-website.md).
+
+## 9. What will not run here, and why
 
 - **`analyze`** needs `GEMINI_API_KEY`; without it, it refuses rather than
   guessing.
@@ -103,7 +152,7 @@ gitignored.
 - **`publish --confirm-real-publish`** needs `FORGEFLOW_PUBLISH_TOKEN` and writes
   to GitHub. Use `publish` without that flag for a dry run.
 
-## 9. Make targets
+## 10. Make targets
 
 | Target | Command |
 | --- | --- |
@@ -116,4 +165,6 @@ gitignored.
 | `make rank` | `uv run forgeflow rank` |
 | `make report` | `uv run forgeflow report` |
 | `make eval` | `uv run python -m evaluation` |
+| `make web` | `uv run --extra web streamlit run web/app.py` |
+| `make test-web` | `uv run --extra web python -m pytest -q` |
 | `make clean` | remove caches and the local database |

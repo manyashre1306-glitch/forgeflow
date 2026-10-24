@@ -20,6 +20,14 @@ dependencies = [
 [project.scripts]
 forgeflow = "forgeflow.cli:app"
 
+# The website (SPEC section 15 portfolio deliverables). Optional on purpose:
+# the core install and CI stay unchanged, and Streamlit is only pulled in with
+# `uv run --extra web streamlit run web/app.py`.
+[project.optional-dependencies]
+web = [
+    "streamlit>=1.40",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=8.3",
@@ -32,7 +40,7 @@ packages = ["src/forgeflow"]
 [tool.ruff]
 line-length = 100
 target-version = "py313"
-src = ["src", "tests", "evaluation", "demo"]
+src = ["src", "tests", "evaluation", "demo", "web"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "C4", "RUF"]

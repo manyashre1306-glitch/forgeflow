@@ -4,7 +4,7 @@
 # Run `make` or `make help` to list the targets.
 
 .DEFAULT_GOAL := help
-.PHONY: help setup test lint format check discover rank report eval demo clean
+.PHONY: help setup test lint format check discover rank report eval demo web test-web clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
@@ -41,6 +41,12 @@ eval: ## Run the SPEC section 11 evaluation harness (offline)
 
 demo: ## Run the offline dry-run end-to-end demonstration (no network, no writes)
 	uv run python -m demo
+
+web: ## Run the ForgeFlow website locally (needs `uv sync --extra web`)
+	uv run --extra web streamlit run web/app.py
+
+test-web: ## Run the test suite including the Streamlit render tests
+	uv run --extra web python -m pytest -q
 
 clean: ## Remove local caches and the local database
 	rm -rf .pytest_cache .ruff_cache
