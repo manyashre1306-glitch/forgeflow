@@ -77,10 +77,21 @@ def _render_context_sources(context: RepoContext | None) -> str:
     lines.append(f"- Detected AI policy: **{rules.ai_policy.value}**")
     for evidence in rules.ai_policy_evidence:
         lines.append(f"  - evidence: {evidence}")
+    lines.append(f"- Requires AI disclosure: {rules.requires_ai_disclosure}")
     lines.append(f"- Requires tests: {rules.requires_tests}")
     lines.append(f"- Requires sign-off: {rules.requires_signoff}")
     lines.append(f"- Requires CLA: {rules.requires_cla}")
-    if rules.ai_policy.value == "unknown":
+    if rules.is_ai_restricted:
+        lines.append("")
+        lines.append(
+            "> **WARNING: this repository restricts AI-generated contributions.** "
+            f"The detected policy is **{rules.ai_policy.value}**"
+            + (" and contributions must disclose AI use." if rules.requires_ai_disclosure else ".")
+            + " Publishing is BLOCKED unless a documented override bound to the "
+            "exact patch hash is recorded (`forgeflow ai-policy-override`). "
+            "Read the repository's contribution guide yourself before proceeding."
+        )
+    elif rules.ai_policy.value == "unknown":
         lines.append(
             "- **Note:** no AI policy was found in the repository guidance. "
             "Unknown is not permission; check the repository yourself before "

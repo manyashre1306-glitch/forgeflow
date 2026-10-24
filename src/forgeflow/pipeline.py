@@ -29,6 +29,7 @@ from forgeflow.models import (
     PatchRecord,
     RepoContext,
     TaskState,
+    UntrustedText,
     ValidationReport,
 )
 from forgeflow.patch import PatchError, build_patch_record, workspace_diff
@@ -191,6 +192,14 @@ def run_context(
         from forgeflow.repository_context import build_repo_context
 
         context = build_repo_context(repo_full_name, issue, workspace)
+
+    # Persist the detected rules so a later review (which may run in a separate
+    # process, with no context object) can still report and enforce the AI
+    # policy. Without this, a restriction detected here would be invisible to
+    # the review bundle and the publish path.
+    storage.record_contribution_rules(
+        conn, repo_full_name, issue_number, context.contribution_rules
+    )
 
     return ContextOutcome(context=context, issue=issue)
 
@@ -485,6 +494,22 @@ def run_review(
 
     if patch is None:
         patch = storage.latest_patch(conn, repo_full_name, issue_number)
+
+    # A standalone review has no context object. Load the rules persisted by the
+    # context step so the bundle still reports a detected AI restriction rather
+    # than silently omitting it.
+    if context is None:
+        stored_rules = storage.latest_contribution_rules(conn, repo_full_name, issue_number)
+        if stored_rules is not None:
+            context = RepoContext(
+                repo_full_name=repo_full_name,
+                issue_number=issue_number,
+                workspace_path=str(
+                    workspace_path_for("data/workspaces", repo_full_name, issue_number)
+                ),
+                issue=UntrustedText(text=issue.body or "", source="issue"),
+                contribution_rules=stored_rules,
+            )
 
     path = review_report_path(repo_full_name, issue_number, report_dir)
     write_review_report(

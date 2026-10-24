@@ -114,6 +114,14 @@ class PublishPlan:
     # an executed check. The body must say so rather than implying a pass.
     exception_authorized_by: str = ""
     exception_reason: str = ""
+    # The AI-use policy detected for the repository, and whether it restricts
+    # AI-generated contributions. A restriction blocks the publish unless a
+    # documented override bound to this patch is recorded.
+    ai_policy: str = ""
+    ai_policy_restricted: bool = False
+    ai_policy_evidence: list[str] = field(default_factory=list)
+    ai_override_authorized_by: str = ""
+    ai_override_reason: str = ""
 
     @property
     def allowed(self) -> bool:
@@ -269,6 +277,41 @@ def _exception_line(authorized_by: str, reason: str) -> str:
     return "Exception " + "; ".join(parts) if parts else "Exception recorded."
 
 
+def _ai_policy_section(
+    *,
+    ai_policy: str,
+    ai_policy_restricted: bool,
+    ai_override_authorized_by: str,
+    ai_override_reason: str,
+) -> list[str]:
+    """The repository AI-use policy lines.
+
+    When the repository restricts AI-generated contributions, the body says so
+    plainly and, if publishing was allowed, states that a human override was
+    recorded rather than letting the PR read as if the repository welcomed it.
+    """
+    if not ai_policy_restricted:
+        return [
+            "_No AI-use restriction was detected in the repository's contribution "
+            "guidance. Absence of a stated policy is not permission; a human "
+            "reviewer should confirm it._"
+        ]
+
+    lines = [
+        "> **This repository's contribution guidance restricts AI-generated "
+        f"contributions.** The detected policy is `{ai_policy}`.",
+    ]
+    if ai_override_authorized_by or ai_override_reason:
+        lines += [
+            ">",
+            "> Publishing this patch was authorized by a **recorded AI-policy "
+            "override** bound to the exact patch hash above.",
+            ">",
+            f"> {_exception_line(ai_override_authorized_by, ai_override_reason)}",
+        ]
+    return lines
+
+
 def _evidence_note(evidence_isolated: bool) -> str:
     """One line stating how trustworthy the reported checks are.
 
@@ -302,6 +345,10 @@ def build_pr_body(
     issue_verified: bool = False,
     exception_authorized_by: str = "",
     exception_reason: str = "",
+    ai_policy: str = "",
+    ai_policy_restricted: bool = False,
+    ai_override_authorized_by: str = "",
+    ai_override_reason: str = "",
 ) -> str:
     """Compose the PR body from recorded facts.
 
@@ -335,6 +382,15 @@ def build_pr_body(
             evidence_isolated=evidence_isolated,
             exception_authorized_by=exception_authorized_by,
             exception_reason=exception_reason,
+        ),
+        "",
+        "## Repository AI-use policy",
+        "",
+        *_ai_policy_section(
+            ai_policy=ai_policy,
+            ai_policy_restricted=ai_policy_restricted,
+            ai_override_authorized_by=ai_override_authorized_by,
+            ai_override_reason=ai_override_reason,
         ),
         "",
         "## Patch",
@@ -545,6 +601,42 @@ def plan_publish(
         )
         return plan
 
+    # Check 5b: the repository's contribution rules must not restrict
+    # AI-generated work. This runs after the patch hash is confirmed, so an
+    # override is bound to the exact diff bytes that will be published. A
+    # restriction is a refusal unless a documented override for this patch
+    # exists, mirroring the validation exception.
+    rules = storage.latest_contribution_rules(conn, repo_full_name, issue_number)
+    plan.ai_policy = rules.ai_policy.value if rules is not None else ""
+    if rules is not None and rules.is_ai_restricted:
+        plan.ai_policy_restricted = True
+        plan.ai_policy_evidence = list(rules.ai_policy_evidence)
+        override = storage.ai_policy_override_for_patch(
+            conn, repo_full_name, issue_number, patch.patch_sha256
+        )
+        detail = f"detected AI policy is '{rules.ai_policy.value}'" + (
+            " with a disclosure requirement" if rules.requires_ai_disclosure else ""
+        )
+        if override is None:
+            check("ai policy", False, detail)
+            plan.refused = True
+            plan.refusal_reason = (
+                f"{repo_full_name} restricts AI-generated contributions ({detail}). "
+                "Publishing is blocked. Record a documented override bound to this "
+                "patch with 'forgeflow ai-policy-override' after reviewing the "
+                "repository's contribution guide yourself."
+            )
+            return plan
+        plan.ai_override_authorized_by = str(override.get("authorized_by") or "")
+        plan.ai_override_reason = str(override.get("reason") or "")
+        check("ai policy", True, f"{detail}; overridden by a recorded override")
+    else:
+        check(
+            "ai policy",
+            True,
+            f"no AI-use restriction detected (policy '{plan.ai_policy or 'unknown'}')",
+        )
+
     # Check 6: destination repository, target branch, and permission scope.
     if not is_repo_allowed(repo_full_name):
         plan.refused = True
@@ -604,6 +696,10 @@ def plan_publish(
         issue_verified=plan.issue_verified,
         exception_authorized_by=plan.exception_authorized_by,
         exception_reason=plan.exception_reason,
+        ai_policy=plan.ai_policy,
+        ai_policy_restricted=plan.ai_policy_restricted,
+        ai_override_authorized_by=plan.ai_override_authorized_by,
+        ai_override_reason=plan.ai_override_reason,
     )
     return plan
 

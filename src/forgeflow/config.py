@@ -45,8 +45,11 @@ class LLMConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    triage_model: str = "gemini-2.5-flash"
-    analysis_model: str = "gemini-2.5-pro"
+    # Defaults match config/repositories.yaml. The 2.5 names are no longer
+    # reachable for new API keys (HTTP 404), so a fresh checkout must not fall
+    # back to them.
+    triage_model: str = "gemini-3.5-flash-lite"
+    analysis_model: str = "gemini-3.6-flash"
     pricing: dict[str, ModelPricing] = Field(default_factory=dict)
     monthly_cap_usd: float = Field(default=5.0, ge=0.0)
     max_retries: int = Field(default=2, ge=0, le=5)

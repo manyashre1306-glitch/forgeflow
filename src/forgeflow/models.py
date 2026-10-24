@@ -327,10 +327,26 @@ class ContributionRules(BaseModel):
 
     ai_policy: AIPolicy = AIPolicy.UNKNOWN
     ai_policy_evidence: list[str] = Field(default_factory=list)
+    # A disclosure requirement ("state that you used AI tools") is a restriction
+    # on how a contribution is submitted even when the policy is not a blanket
+    # ban, so it is tracked separately from the policy verdict.
+    requires_ai_disclosure: bool = False
     requires_tests: bool = False
     requires_signoff: bool = False
     requires_cla: bool = False
     sources: list[str] = Field(default_factory=list)
+
+    @property
+    def is_ai_restricted(self) -> bool:
+        """Whether AI use is constrained at all (prohibited or restricted).
+
+        A disclosure requirement counts as restricted: the policy is not
+        ``unknown`` and it is not a green light, so publishing must be blocked
+        unless a human records a documented override.
+        """
+        return self.ai_policy in (AIPolicy.PROHIBITED, AIPolicy.RESTRICTED) or (
+            self.requires_ai_disclosure
+        )
 
 
 class FileExcerpt(BaseModel):

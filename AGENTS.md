@@ -162,3 +162,42 @@ the exact diff bytes; gates after every step are `uv run python -m ruff check .`
 `uv run python -m ruff format --check .`, `uv run python -m pytest -q`.
 
 Current gate state: 923 tests pass, ruff check and format clean.
+
+## Phase 2 AI-policy detection and enforcement (2026-10-24)
+
+Branch `feat/fix-models-and-policy` (not merged). Three fixes:
+
+1. **Reachable models and correct pricing** (`e8d7238`). `triage_model` is
+   `gemini-3.5-flash-lite`, `analysis_model` is `gemini-3.6-flash`. The previous
+   `gemini-2.5-flash` / `gemini-2.5-pro` return HTTP 404 ("no longer available to
+   new users"). Prices in `config/repositories.yaml` are real, not 0.0.
+2. **Model-API timeouts map to a clean error** (`893cb82`). A timeout is recorded
+   in `llm_usage` with `success = 0` and a readable message, not a raw traceback.
+3. **AI-policy detection gap closed.** `detect_contribution_rules` returned
+   `ai_policy=unknown` for scikit-learn even though its contributing guide bans
+   AI-generated PRs. The cause was the pattern list not matching the real wording
+   and only matching per line. Fixes:
+   - `repository_context.py`: new prohibition and disclosure patterns; a
+     whitespace-normalised second pass so a rule split across a hard wrap still
+     matches. `AI_DISCLOSURE_PATTERNS` is separate, so a disclosure duty is not
+     mislabelled as a ban.
+   - `ContributionRules.requires_ai_disclosure` and `.is_ai_restricted`
+     (`models.py`). A disclosure requirement counts as restricted.
+   - `run_context` persists the rules (`contribution_rules` table);
+     `run_review` loads them when no context object is supplied, so a standalone
+     review still warns.
+   - `review.py` prints a bold WARNING when the policy restricts AI use.
+   - `publisher.plan_publish` gained an "ai policy" check. A detected restriction
+     **refuses** the publish unless a documented override bound to the exact patch
+     hash exists (`ai_policy_overrides` table). The override unlocks only this
+     check, never the patch-integrity guards.
+   - `forgeflow ai-policy-override <ref> --reason ...` records the override and
+     writes a `ai_policy.override_recorded` audit event. `--reason` is required.
+
+Environment facts unchanged: no container runtime, no `JULES_API_KEY`. Phase 2
+still performs no external writes.
+
+Gates: 959 tests pass, ruff check and format clean. New test files:
+`tests/test_ai_policy_override_cli.py`; additions to
+`tests/test_repository_context.py`, `tests/test_pipeline_phase2.py`,
+`tests/test_publisher.py`.

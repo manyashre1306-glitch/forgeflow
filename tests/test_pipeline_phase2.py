@@ -497,6 +497,84 @@ def test_review_report_path_is_deterministic_in_shape() -> None:
     assert path.suffix == ".md"
 
 
+# --- review bundle: AI policy restriction -----------------------------------
+
+
+def _restricted_rules():
+    from forgeflow.models import AIPolicy, ContributionRules
+
+    return ContributionRules(
+        ai_policy=AIPolicy.PROHIBITED,
+        ai_policy_evidence=["CONTRIBUTING.md: Do not generate PRs using AI."],
+        requires_ai_disclosure=True,
+    )
+
+
+def test_review_report_warns_on_ai_restriction() -> None:
+    from forgeflow.models import RepoContext, UntrustedText
+
+    context = RepoContext(
+        repo_full_name=REPO,
+        issue_number=7,
+        workspace_path="ws",
+        issue=UntrustedText(text="x", source="issue"),
+        contribution_rules=_restricted_rules(),
+    )
+    text = render_review_report(
+        issue=make_issue(), analysis=None, agent_result=None, patch=None, context=context
+    )
+    assert "WARNING: this repository restricts AI-generated contributions" in text
+    assert "BLOCKED" in text
+
+
+def test_review_report_shows_disclosure_requirement() -> None:
+    from forgeflow.models import RepoContext, UntrustedText
+
+    context = RepoContext(
+        repo_full_name=REPO,
+        issue_number=7,
+        workspace_path="ws",
+        issue=UntrustedText(text="x", source="issue"),
+        contribution_rules=_restricted_rules(),
+    )
+    text = render_review_report(
+        issue=make_issue(), analysis=None, agent_result=None, patch=None, context=context
+    )
+    assert "Requires AI disclosure: True" in text
+
+
+def test_run_context_persists_the_detected_rules(conn, workspace, tmp_path) -> None:
+    """The rules must survive so a later review can read them."""
+    seed_issue(conn)
+    run_context(conn, REPO, 7, workspace_root=tmp_path / "wsroot", source_path=workspace)
+    stored = storage.latest_contribution_rules(conn, REPO, 7)
+    assert stored is not None
+    assert stored.requires_tests is True  # the fixture CONTRIBUTING says so
+
+
+def test_standalone_review_reads_the_persisted_policy(conn, tmp_path) -> None:
+    """A review with no context object still warns when a restriction is stored."""
+    from forgeflow.models import AIPolicy, ContributionRules
+
+    seed_issue(conn, state=TaskState.AWAITING_PLAN_APPROVAL)
+    storage.record_contribution_rules(
+        conn,
+        REPO,
+        7,
+        ContributionRules(
+            ai_policy=AIPolicy.PROHIBITED,
+            ai_policy_evidence=["CONTRIBUTING.md: no AI-generated code"],
+        ),
+    )
+    outcome = run_review(conn, REPO, 7, report_dir=tmp_path / "reports")
+    text = outcome.report_path.read_text(encoding="utf-8")
+    assert "restricts AI-generated contributions" in text
+
+
+def test_latest_contribution_rules_none_when_absent(conn) -> None:
+    assert storage.latest_contribution_rules(conn, REPO, 7) is None
+
+
 # --- pipeline: context ------------------------------------------------------
 
 
