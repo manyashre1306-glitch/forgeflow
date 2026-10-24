@@ -545,12 +545,31 @@ STOPWORDS = frozenset(
 )
 
 
-def _issue_terms(issue: Issue) -> tuple[set[str], set[str]]:
-    """Return (explicit paths, search terms) taken from the issue text."""
+def issue_terms(issue: Issue) -> tuple[set[str], set[str]]:
+    """Return (explicit paths, search terms) taken from the issue text.
+
+    Public because the website's hosted context builder reuses it to decide
+    which repository files to fetch through the read-only API.
+    """
     text = f"{issue.title}\n{issue.body}"
     paths = set(_PATH_IN_PROSE.findall(text))
     terms = {match.lower() for match in _IDENTIFIER.findall(text) if match.lower() not in STOPWORDS}
     return paths, terms
+
+
+def score_path_candidate(relative: str, explicit_paths: set[str], terms: set[str]) -> int:
+    """Score one repository-relative path against an issue's paths and terms.
+
+    Extracted so the website's hosted context builder ranks files exactly the
+    same way the clone-based selector does, rather than re-implementing the
+    heuristic and drifting from it.
+    """
+    if relative in explicit_paths:
+        return 100
+    if any(relative.endswith(candidate) for candidate in explicit_paths):
+        return 80
+    lowered = relative.lower()
+    return sum(1 for term in terms if term in lowered)
 
 
 def select_relevant_files(
@@ -567,7 +586,7 @@ def select_relevant_files(
     result is capped at ``max_files``. The boolean return reports whether the
     cap was reached.
     """
-    explicit_paths, terms = _issue_terms(issue)
+    explicit_paths, terms = issue_terms(issue)
 
     candidates: list[tuple[int, str, Path]] = []
     for path in sorted(root.rglob("*")):
@@ -583,14 +602,7 @@ def select_relevant_files(
         # come out of the issue text.
         relative_str = relative.as_posix()
 
-        score = 0
-        if relative_str in explicit_paths:
-            score = 100
-        elif any(relative_str.endswith(candidate) for candidate in explicit_paths):
-            score = 80
-        else:
-            lowered = relative_str.lower()
-            score = sum(1 for term in terms if term in lowered)
+        score = score_path_candidate(relative_str, explicit_paths, terms)
         if score > 0:
             candidates.append((score, relative_str, path))
 

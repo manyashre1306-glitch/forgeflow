@@ -85,7 +85,18 @@ class GitHubReader(Protocol):
 
     def has_file(self, full_name: str, path: str, *, ref: str | None = ...) -> bool: ...
 
+    def get_file_content(
+        self,
+        full_name: str,
+        path: str,
+        *,
+        ref: str | None = ...,
+        max_bytes: int | None = ...,
+    ) -> str | None: ...
+
     def list_directory(self, full_name: str, path: str = ...) -> list[str]: ...
+
+    def list_directory_entries(self, full_name: str, path: str = ...) -> list[dict[str, str]]: ...
 
     def get_issue_timeline(self, full_name: str, number: int) -> list[dict[str, Any]]: ...
 
@@ -108,13 +119,20 @@ class GitHubClient:
         max_retries: int = MAX_RETRIES,
         sleep: Callable[[float], None] = time.sleep,
         max_rate_limit_wait: float = 60.0,
+        allow_anonymous: bool = False,
     ) -> None:
         if token is None or not token.strip():
-            raise MissingTokenError(
-                "GITHUB_TOKEN is not set. Set it in your environment or in a .env file "
-                "(see .env.example). ForgeFlow needs a read-only token to query GitHub."
-            )
-        self._token = token.strip()
+            if not allow_anonymous:
+                raise MissingTokenError(
+                    "GITHUB_TOKEN is not set. Set it in your environment or in a .env file "
+                    "(see .env.example). ForgeFlow needs a read-only token to query GitHub."
+                )
+            # Anonymous mode is an explicit opt-in used by the hosted website,
+            # where a visitor may supply no token. Requests carry no Authorization
+            # header, so GitHub applies its much lower anonymous rate limit.
+            self._token = ""
+        else:
+            self._token = token.strip()
         self._owns_client = client is None
         self._client = client or httpx.Client(timeout=timeout)
         self._base_url = base_url.rstrip("/")
@@ -138,11 +156,13 @@ class GitHubClient:
     # -- internals -----------------------------------------------------------
 
     def _headers(self) -> dict[str, str]:
-        return {
-            "Authorization": f"Bearer {self._token}",
+        headers = {
             "Accept": "application/vnd.github+json",
             "X-GitHub-Api-Version": "2022-11-28",
         }
+        if self._token:
+            headers["Authorization"] = f"Bearer {self._token}"
+        return headers
 
     def _request(self, url: str, params: dict[str, Any] | None = None) -> httpx.Response:
         """Perform one GET with retries, honouring rate limits.
@@ -301,11 +321,69 @@ class GitHubClient:
             raise
         return True
 
+    def get_file_content(
+        self,
+        full_name: str,
+        path: str,
+        *,
+        ref: str | None = None,
+        max_bytes: int | None = None,
+    ) -> str | None:
+        """Read one file's text from the contents API. Read-only.
+
+        Returns ``None`` when the path is absent, is a directory, or is not
+        valid UTF-8 text. The contents endpoint returns base64 for a file under
+        1 MB; a larger file comes back with ``encoding="none"`` and no body, and
+        is treated as absent so a caller cannot be handed a truncated file that
+        looks complete.
+
+        ``max_bytes`` caps the decoded size; a file that would exceed it is
+        refused (``None``) rather than silently truncated, so the caller's size
+        cap is honest.
+        """
+        import base64
+
+        params = {"ref": ref} if ref else None
+        try:
+            payload = self._get_json(f"{self._base_url}/repos/{full_name}/contents/{path}", params)
+        except GitHubError as exc:
+            if "not found" in str(exc):
+                return None
+            raise
+        if not isinstance(payload, dict):
+            # A list means the path is a directory, not a file.
+            return None
+        if payload.get("encoding") != "base64":
+            return None
+        content = payload.get("content")
+        if not isinstance(content, str):
+            return None
+        try:
+            raw = base64.b64decode(content, validate=False)
+        except Exception:
+            return None
+        if max_bytes is not None and len(raw) > max_bytes:
+            return None
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+
     def list_directory(self, full_name: str, path: str = "") -> list[str]:
         """List entry names in a repository directory.
 
         Returns an empty list when the path does not exist, so callers can treat
         "missing" and "empty" the same way. Read-only.
+        """
+        return [entry["name"] for entry in self.list_directory_entries(full_name, path)]
+
+    def list_directory_entries(self, full_name: str, path: str = "") -> list[dict[str, str]]:
+        """List a directory's entries as ``{"name": ..., "type": ...}`` dicts.
+
+        ``type`` is GitHub's own value (``file``, ``dir``, ``symlink``,
+        ``submodule``). The website's hosted context builder needs the type to
+        walk a tree without cloning; name-based guessing misclassifies a
+        directory that contains a dot. Returns an empty list for a missing path.
         """
         url = f"{self._base_url}/repos/{full_name}/contents"
         if path:
@@ -318,11 +396,13 @@ class GitHubClient:
             raise
         if not isinstance(payload, list):
             return []
-        names: list[str] = []
+        entries: list[dict[str, str]] = []
         for entry in payload:
             if isinstance(entry, dict) and "name" in entry:
-                names.append(str(entry["name"]))
-        return names
+                entries.append(
+                    {"name": str(entry["name"]), "type": str(entry.get("type", "file"))}
+                )
+        return entries
 
     def get_issue_timeline(self, full_name: str, number: int) -> list[dict[str, Any]]:
         """Fetch an issue's timeline, used to detect linked pull requests."""
