@@ -1,14 +1,14 @@
 # Threat model
 
-Scope: ForgeFlow up to the end of Phase 3. This covers the threats SPEC section
-9 names, the mitigation actually implemented in this repository, and the risks
-that remain. It is written to be checked against the code, not to sound
+Scope: ForgeFlow through the end of Phase 5. This covers the threats SPEC
+section 9 names, the mitigation actually implemented in this repository, and the
+risks that remain. It is written to be checked against the code, not to sound
 reassuring.
 
-Nothing in Phase 3 performs an external write action. There is no code path in
-this repository that creates a pull request, posts a comment, pushes a branch, or
-edits an issue. Phase 4 is where publishing is added, and this document must be
-revised before that happens.
+Phases 1–3 perform no external write. Phase 4 adds exactly one: opening a
+**draft** pull request, behind a recorded human approval, a separate credential,
+and an allowlist (see threat 10). Phase 5 adds documentation, an evaluation
+harness, and CI; it adds no new external write and no new credential.
 
 ## Trust boundaries
 
@@ -176,9 +176,7 @@ repository, and the target branch. `verify_patch_hash()` recomputes the hash
 from the bytes and any difference invalidates the approval, requiring a fresh
 one. Phase 3 stores approvals with their timestamp and hash.
 
-**Residual risk.** None identified within Phase 3, because nothing publishes.
-The check must be repeated at publish time in Phase 4, immediately before the
-external write, since the patch could change between approval and publishing.
+**Residual risk.** Low. The check is repeated at publish time: `publisher` re-derives the patch hash immediately before the external write and refuses if the recorded approval does not bind that exact hash. A patch that changed between approval and publishing cannot be published without a fresh approval, and there is no force flag.
 
 ### 9. Gaming the outcome metric
 
@@ -203,6 +201,38 @@ PRs, or to optimise for merge count alone and ignore useful review feedback.
 of one operator's PRs. It is off by default and should stay off until there are
 enough real tracked outcomes to judge whether the nudge behaves sensibly.
 
+### 10. Publishing a patch that should not be published
+
+**Threat.** Phase 4 adds the only external write: opening a pull request. The
+risks are publishing to the wrong repository, publishing an unapproved or
+changed patch, publishing a patch that failed validation, leaking the write
+credential, or opening a non-draft PR that looks like a finished contribution.
+
+**Mitigation.**
+
+- **Allowlist.** `PUBLISH_ALLOWLIST` in `publisher.py` names the only repository
+  ForgeFlow may write to; anything else is refused before any client is built.
+- **Approval bound to bytes.** Publishing requires a recorded approval whose
+  hash matches the exact diff about to be pushed (threat 8). There is no force
+  flag.
+- **Validation gate.** A failed or errored check blocks publishing unless a
+  documented `validation-exception` names that exact patch hash (SPEC 7).
+- **Separate credential.** The write path uses `FORGEFLOW_PUBLISH_TOKEN`, which
+  never falls back to `GITHUB_TOKEN`. Discovery, analysis, and outcome tracking
+  use the read-only token. Tests assert the read modules cannot reach the write
+  token.
+- **Draft only, no force.** The PR is opened as a draft; ForgeFlow never
+  auto-merges and never force-pushes (`test_draft_flag_cannot_be_turned_off`,
+  `test_push_branch_never_updates_an_existing_ref`).
+- **Verified issue reference.** The PR body claims `Fixes #N` only when the issue
+  is confirmed through the read-only client; otherwise the reference is labelled
+  unverified.
+
+**Residual risk.** The token is static and long-lived (see "Not implemented").
+The allowlist is a code constant, not a runtime policy, so changing it is a code
+change. A compromised operator machine could still use the token directly; the
+guarantees here are about ForgeFlow's own behaviour, not about the host.
+
 ## Kill switch
 
 Three independent sources, any one sufficient to stop all model calls and
@@ -224,5 +254,10 @@ check and before the isolation check, so it stops a run in both cases.
   Recorded honestly in every validation report rather than assumed away.
 - **No external audit sink.** The append-only guarantee is local to the SQLite
   file.
-- **No integration test against a real repository.** It would require a token
-  with write scope and would risk an external action, which Phase 3 forbids.
+- **No automated integration test against a real repository.** The one real
+  publish (draft PR to the sandbox repository) was performed manually and is
+  recorded in the audit log; automating it would require a write-scope token in
+  CI, which this project deliberately does not do.
+- **No credential rotation or short-lived token minting.** The publishing token
+  is a static secret read from the environment. Least privilege is enforced by
+  the allowlist and the separate token, not by token lifetime.
