@@ -19,9 +19,15 @@ and writes a local review bundle.
 | --- | --- | --- |
 | 1 | Discovery, dedupe, ranking, SQLite, reports, CLI | Complete |
 | 2 | Repo context, agent adapter, analysis, sandbox, patch + review | Complete, with a documented limitation |
-| 3 | Validation, task states, security checks, approval-boundary tests | Not started |
-| 4 | Controlled publishing (draft PRs), feedback tracking | Not started |
+| 3 | Validation, task states, security checks, approval-boundary tests | Complete |
+| 4 | Controlled publishing (draft PRs), feedback tracking, discovery-only scheduling | Complete, with a documented limitation |
 | 5 | Documentation, threat model, evaluation, portfolio README | Not started |
+
+**Phase 4 real run.** Publishing was exercised end to end once, against the
+sandbox repository on the publish allowlist: draft PR
+[`manyashre1306-glitch/forgeflow-sandbox#2`](https://github.com/manyashre1306-glitch/forgeflow-sandbox/pull/2).
+Its state is tracked with `forgeflow track`, which records it as **open** and
+**draft** (not merged). No other repository has been written to.
 
 **Phase 2 limitation, stated plainly.** ForgeFlow cannot run a real coding agent
 end-to-end in the development environment used so far, for two independent
@@ -266,14 +272,17 @@ clones come from a local fixture. The suite needs no `GITHUB_TOKEN`, no
 
 ```
 src/forgeflow/
-  cli.py                 Typer commands: discover, rank, report, shortlist,
-                         context, analyze, implement, review
+  cli.py                 Typer commands: discover, schedule, rank, report,
+                         shortlist, context, analyze, implement, review,
+                         workspace, kill-switch, audit-log, track, metrics,
+                         approve, request-changes, reject, discard, validate,
+                         validation-exception, publish
   config.py              allowlist, weights, LLM config; secrets from env only
   models.py              Pydantic models, state machine, untrusted-text model
   github_client.py       the only module that performs GitHub HTTP; read-only
   discovery.py           repository metadata and issue search
   dedupe.py              identity dedupe and eligibility filtering, with reasons
-  ranking.py             the six weighted factors; pure functions, no I/O
+  ranking.py             the six weighted factors + capped outcome adjustment
   storage.py             SQLite schema, upserts, state transitions, costs, patches
   report.py              Phase 1 Markdown report generation
   repository_context.py  shallow clone + size-limited context extraction
@@ -284,10 +293,21 @@ src/forgeflow/
   patch.py               diff analysis and SHA-256 patch hashing
   pipeline.py            context -> analyze -> implement -> review orchestration
   review.py              local review bundle generation
+  validation.py          runs the target repo's tests/lint/type checks
+  approval.py            approve / request-changes / reject / discard boundary
+  publisher.py           pre-publish checks, gated branch push, draft PR
+  publish_token.py       the publishing credential; no fallback to GITHUB_TOKEN
+  diff_apply.py          strict unified-diff applier for the branch push
+  outcome_tracker.py     tracks PR state and aggregates outcomes per repository
+  scheduler.py           optional discovery-only cycle (never publishes)
+  audit.py               append-only audit log
+  killswitch.py          persistent kill switch and per-task guardrails
+  security.py            secret scrubbing for recorded output
 config/repositories.yaml   allowlist, weights, skill keywords, LLM settings
 docs/SPEC.md               the project specification
 docs/agent-evaluation.md   verified Jules and Gemini CLI capabilities
 docs/phase2-notes.md       Phase 2 limitations and untested items
+docs/threat-model.md       threats and mitigations, including the publish path
 ```
 
 ## License
