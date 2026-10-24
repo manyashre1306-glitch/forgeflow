@@ -7,7 +7,8 @@ network, and the clone tests use ``source_path`` so they exercise the real
 
 from __future__ import annotations
 
-import shutil
+import os
+import stat
 import subprocess
 from pathlib import Path
 
@@ -17,12 +18,15 @@ from forgeflow.models import AIPolicy, Issue, TrustLevel, UntrustedText
 from forgeflow.repository_context import (
     MAX_FILE_BYTES,
     RepositoryContextError,
+    _force_writable_and_retry,
     build_repo_context,
     default_workspace_root,
     detect_contribution_rules,
     detect_test_layout,
     prepare_repo_context,
     read_limited_text,
+    remove_tree,
+    remove_workspace,
     select_relevant_files,
     shallow_clone,
     workspace_path_for,
@@ -435,6 +439,31 @@ def test_explicit_path_outranks_a_loose_name_match(tmp_path) -> None:
     assert excerpts[0].path == "widget/parser.py"
 
 
+def test_excerpt_paths_always_use_forward_slashes(tmp_path) -> None:
+    """Stored paths must be identical on every OS, so compare with POSIX form.
+
+    ``str(Path)`` yields backslashes on Windows, which would break the
+    ``relative_str in explicit_paths`` comparison against issue text that always
+    uses forward slashes. ``as_posix()`` keeps one canonical form.
+    """
+    root = tmp_path / "r"
+    write(root, "widget/parser.py", "x = 1\n")
+    excerpts, _ = select_relevant_files(root, make_issue())
+    assert excerpts
+    for excerpt in excerpts:
+        assert "\\" not in excerpt.path
+        assert excerpt.path == Path(excerpt.path).as_posix()
+
+
+def test_test_layout_paths_always_use_forward_slashes(tmp_path) -> None:
+    root = tmp_path / "r"
+    write(root, "tests/test_widget.py", "x = 1\n")
+    layout = detect_test_layout(root)
+    assert "tests/test_widget.py" in layout
+    for entry in layout:
+        assert "\\" not in entry
+
+
 def test_no_terms_yields_no_files(tmp_path) -> None:
     root = tmp_path / "r"
     write(root, "widget/other.py", "x = 1\n")
@@ -574,5 +603,65 @@ def test_cleanup_removes_workspace(tmp_path, fixture_repo) -> None:
     destination = tmp_path / "clone"
     shallow_clone(REPO, destination, source_path=fixture_repo)
     assert destination.exists()
-    shutil.rmtree(destination)
+    remove_tree(destination)
     assert not destination.exists()
+
+
+def test_remove_tree_deletes_a_tree_of_read_only_files(tmp_path) -> None:
+    """A tree containing read-only files must still be removable.
+
+    This is the shape a Windows git clone produces: read-only files inside
+    writable directories. ``shutil.rmtree`` raises on the read-only files there.
+    On POSIX ``unlink`` depends on the directory's write bit, not the file's, so
+    the handler is not needed and the delete simply succeeds. Either way the
+    contract holds: the tree is gone.
+    """
+    root = tmp_path / "ro"
+    (root / "sub").mkdir(parents=True)
+    for name in ("a.txt", "sub/b.txt"):
+        path = root / name
+        path.write_text("data\n", encoding="utf-8")
+        os.chmod(path, stat.S_IREAD)
+
+    remove_tree(root)
+    assert not root.exists()
+
+
+def test_remove_tree_clears_the_read_only_flag(tmp_path) -> None:
+    """The handler must make the target writable, then retry the removal.
+
+    This exercises the handler directly, so it is verified on Linux too where
+    ``rmtree`` would otherwise never call it.
+    """
+    path = tmp_path / "locked.txt"
+    path.write_text("x\n", encoding="utf-8")
+    os.chmod(path, stat.S_IREAD)
+    assert not os.access(path, os.W_OK)
+
+    _force_writable_and_retry(os.remove, str(path), None)
+
+    assert not path.exists()
+
+
+def test_remove_tree_handler_makes_a_read_only_dir_writable(tmp_path) -> None:
+    """For a directory the handler must add the write and execute bits."""
+    directory = tmp_path / "locked_dir"
+    directory.mkdir()
+    os.chmod(directory, stat.S_IREAD | stat.S_IEXEC)
+
+    _force_writable_and_retry(os.rmdir, str(directory), None)
+
+    assert not directory.exists()
+
+
+def test_remove_workspace_deletes_a_read_only_workspace(tmp_path) -> None:
+    """The src/ cleanup path must handle read-only files too."""
+    root = tmp_path / "wsroot"
+    target = workspace_path_for(root, REPO, 7)
+    target.mkdir(parents=True)
+    locked = target / "locked.txt"
+    locked.write_text("x\n", encoding="utf-8")
+    os.chmod(locked, stat.S_IREAD)
+
+    assert remove_workspace(root, REPO, 7) is True
+    assert not target.exists()

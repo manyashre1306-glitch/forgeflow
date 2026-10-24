@@ -19,8 +19,10 @@ Only read-only git commands are used. Nothing in this module writes to a remote.
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
+import stat
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
@@ -200,6 +202,39 @@ class RepositoryContextError(RuntimeError):
 # --- workspace management ---------------------------------------------------
 
 
+def _force_writable_and_retry(func, path, _exc_info) -> None:
+    """Clear the read-only flag on ``path`` and retry the failed removal.
+
+    On Windows a ``git clone`` leaves many files read-only, and ``shutil.rmtree``
+    refuses to delete a read-only file. Linux has no such flag, so this handler
+    rarely runs there. The existing mode is preserved and only the write bit is
+    added; a directory also needs its execute bits, otherwise the retry cannot
+    descend into it.
+    """
+    try:
+        mode = os.stat(path).st_mode
+        new_mode = mode | stat.S_IWRITE
+        if stat.S_ISDIR(mode):
+            new_mode |= stat.S_IEXEC | stat.S_IREAD
+        os.chmod(path, new_mode)
+        func(path)
+    except OSError:
+        # Nothing more can be done; let the original error stand rather than
+        # masking it with a different one.
+        pass
+
+
+def remove_tree(path: Path | str) -> None:
+    """Remove a directory tree, tolerating read-only files.
+
+    ``shutil.rmtree`` fails on Windows when the tree contains read-only files,
+    which is exactly what a git clone produces (``.git/objects`` are read-only).
+    Using ``onexc`` to clear the flag and retry keeps a single code path that
+    works on every OS.
+    """
+    shutil.rmtree(path, onexc=_force_writable_and_retry)
+
+
 def default_workspace_root() -> Path:
     """Return the gitignored directory that holds cloned workspaces."""
     return Path("data/workspaces")
@@ -234,7 +269,7 @@ def shallow_clone(
 
     destination = Path(destination)
     if destination.exists():
-        shutil.rmtree(destination)
+        remove_tree(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
 
     # git ignores --depth when cloning a plain local path; a file:// URI makes it
@@ -336,7 +371,7 @@ def detect_test_layout(root: Path) -> list[str]:
             or (path.name.startswith("test_") and path.suffix == ".py")
         )
         if is_test_dir or is_test_file:
-            found.append(str(relative))
+            found.append(relative.as_posix())
     return found
 
 
@@ -543,7 +578,10 @@ def select_relevant_files(
             continue
         if path.suffix.lower() in SKIP_SUFFIXES:
             continue
-        relative_str = str(relative)
+        # Always store forward slashes, so the recorded path is byte-identical on
+        # Windows and Linux and can be compared with the POSIX-style paths that
+        # come out of the issue text.
+        relative_str = relative.as_posix()
 
         score = 0
         if relative_str in explicit_paths:
@@ -694,7 +732,7 @@ def remove_workspace(
     target = workspace_path_for(root, repo_full_name, issue_number)
     if not target.is_dir():
         return False
-    shutil.rmtree(target)
+    remove_tree(target)
     return True
 
 
@@ -748,7 +786,7 @@ def prune_workspaces(
 
     removed: list[Path] = []
     for path in stale:
-        shutil.rmtree(path)
+        remove_tree(path)
         removed.append(path)
     return removed
 
