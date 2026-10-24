@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass, field
+from typing import Protocol
 
 from forgeflow import approval as approval_module
 from forgeflow import audit, storage
@@ -70,6 +71,17 @@ class PublisherError(RuntimeError):
 
 class RefusedByPolicyError(PublisherError):
     """Raised when a check refuses the publish and fresh approval is needed."""
+
+
+class GitHubReadClient(Protocol):
+    """The read-only GitHub surface the publisher needs for verification.
+
+    Kept as a protocol so a test can pass a fake without a network, and so the
+    publisher never depends on the write client for a read. The read credential
+    and the publishing credential are different tokens with different scopes.
+    """
+
+    def issue_exists(self, repo_full_name: str, issue_number: int) -> bool: ...
 
 
 @dataclass
@@ -384,6 +396,7 @@ def plan_publish(
     target_branch: str,
     mode: PublishMode = PublishMode.DRY_RUN,
     client: GitHubWriteClient | None = None,
+    read_client: GitHubReadClient | None = None,
     actor: str = "operator",
 ) -> PublishPlan:
     """Run every pre-publish check and return what would be written.
@@ -391,6 +404,12 @@ def plan_publish(
     Performs no write. The six checks SPEC section 8 lists are evaluated in
     order and recorded on the plan, so a refusal names the exact check that
     failed. ``mode`` only labels the plan; the caller decides whether to act.
+
+    ``client`` is the write client, used to confirm the target branch and the
+    write scope. ``read_client`` is a read-only client used to verify the
+    referenced issue exists; it defaults to ``client`` for callers that only
+    have one object, but the CLI passes the read-only client so the publishing
+    token is never asked to read.
     """
     # Check 1, first: the repository must be on the hard-coded allowlist. This
     # runs before any database lookup so a third-party target is refused before
@@ -562,7 +581,9 @@ def plan_publish(
     plan.evidence_isolated = _evidence_isolated(
         conn, repo_full_name, issue_number, patch.patch_sha256
     )
-    plan.issue_verified = _issue_verified(client, repo_full_name, issue_number)
+    plan.issue_verified = _issue_verified(
+        read_client if read_client is not None else client, repo_full_name, issue_number
+    )
     exception = storage.validation_exception_for_patch(
         conn, repo_full_name, issue_number, patch.patch_sha256
     )
@@ -606,20 +627,26 @@ def _evidence_isolated(
 
 
 def _issue_verified(
-    client: GitHubWriteClient | None,
+    read_client: GitHubReadClient | None,
     repo_full_name: str,
     issue_number: int,
 ) -> bool:
     """Whether the issue exists on GitHub, so 'Fixes #N' can be claimed.
 
-    With no client, or on any read failure, this returns False. An unverified
-    reference is labelled unverified rather than silently asserted, because a
-    closing keyword that points nowhere is a false claim.
+    This reads with the *read-only* client, not the publishing client. The
+    publishing token is deliberately narrow and may not have read access to the
+    issue endpoints; using it here made a real issue look unconfirmed. Reads use
+    the read credential, writes use the write credential, and the two never
+    cross.
+
+    With no read client, or on any read failure, this returns False. An
+    unverified reference is labelled unverified rather than silently asserted,
+    because a closing keyword that points nowhere is a false claim.
     """
-    if client is None:
+    if read_client is None:
         return False
     try:
-        return client.issue_exists(repo_full_name, issue_number)
+        return read_client.issue_exists(repo_full_name, issue_number)
     except Exception:
         return False
 
@@ -762,6 +789,7 @@ def publish(
     target_branch: str,
     mode: PublishMode = PublishMode.DRY_RUN,
     client: GitHubWriteClient | None = None,
+    read_client: GitHubReadClient | None = None,
     actor: str = "operator",
 ) -> PublicationRecord:
     """Publish the reviewed patch as a draft PR, or record a dry run.
@@ -769,6 +797,10 @@ def publish(
     Dry-run is the default. A real write requires ``mode=PublishMode.REAL`` and
     every check in :func:`plan_publish` to pass. Returns the recorded attempt
     either way, so a dry run is visible in the log.
+
+    ``read_client`` verifies the referenced issue with a read-only credential;
+    when omitted the write client is used, which is correct only when the same
+    object holds both scopes.
     """
     plan = plan_publish(
         conn,
@@ -777,6 +809,7 @@ def publish(
         target_branch=target_branch,
         mode=mode,
         client=client,
+        read_client=read_client,
         actor=actor,
     )
 

@@ -1289,6 +1289,73 @@ def test_plan_claims_fixes_when_the_issue_exists(conn) -> None:
     assert plan.body.startswith("Fixes #7")
 
 
+class _ReadOnlyFake:
+    """A read-only client that knows exactly which issues exist.
+
+    Models the real split: the publishing token cannot read the issues API, but
+    the read-only token can. It records calls so a test can prove the read was
+    made through this object and not the write client.
+    """
+
+    def __init__(self, existing: set[int]) -> None:
+        self.existing = existing
+        self.calls: list[tuple[str, int]] = []
+
+    def issue_exists(self, repo_full_name: str, issue_number: int) -> bool:
+        self.calls.append((repo_full_name, issue_number))
+        return issue_number in self.existing
+
+
+def test_real_publish_verifies_the_issue_with_the_read_client(conn) -> None:
+    """The bug: a real issue read as 'unconfirmed' because the write token read it.
+
+    The publishing token cannot read the issues API, so verification must use
+    the read-only client. Here the write client 404s the issue and the read
+    client confirms it, so the body must still claim 'Fixes #7'.
+    """
+    seed_ready(conn)
+    write_http = FakeHTTP(existing_issues=[])  # the write client cannot see issue 7
+    read_client = _ReadOnlyFake(existing={7})
+    plan = publisher.plan_publish(
+        conn,
+        SANDBOX,
+        7,
+        target_branch=BRANCH,
+        client=make_client(write_http),
+        read_client=read_client,
+    )
+    assert read_client.calls == [(SANDBOX, 7)], "the issue must be verified via the read client"
+    assert plan.issue_verified is True
+    assert plan.body.startswith("Fixes #7")
+
+
+def test_real_publish_falls_back_to_the_write_client_for_verification(conn) -> None:
+    """Callers with one object holding both scopes keep working unchanged."""
+    seed_ready(conn)
+    http = FakeHTTP(existing_issues=["7"])
+    plan = publisher.plan_publish(conn, SANDBOX, 7, target_branch=BRANCH, client=make_client(http))
+    assert plan.issue_verified is True
+    assert plan.body.startswith("Fixes #7")
+
+
+def test_real_publish_does_not_claim_fixes_when_the_read_client_denies(conn) -> None:
+    """A read client that reports the issue absent must keep the honest label."""
+    seed_ready(conn)
+    read_client = _ReadOnlyFake(existing=set())
+    plan = publisher.plan_publish(
+        conn,
+        SANDBOX,
+        7,
+        target_branch=BRANCH,
+        client=make_client(FakeHTTP(existing_issues=["7"])),
+        read_client=read_client,
+    )
+    assert read_client.calls == [(SANDBOX, 7)]
+    assert plan.issue_verified is False
+    assert not plan.body.startswith("Fixes #7")
+    assert "could not be verified" in plan.body
+
+
 # ==========================================================================
 # An exception with no executed checks must read as exactly that
 # ==========================================================================

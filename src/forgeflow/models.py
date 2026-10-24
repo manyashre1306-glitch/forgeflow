@@ -750,3 +750,123 @@ class ApprovalRecord(BaseModel):
         if self.target_branch != target_branch:
             return False, (f"approval was for branch {self.target_branch!r}, not {target_branch!r}")
         return True, ""
+
+
+# --------------------------------------------------------------------------
+# Phase 4: pull-request outcomes and evaluation (SPEC sections 11 and 15)
+# --------------------------------------------------------------------------
+
+
+class PullRequestStatus(StrEnum):
+    """The three states a pull request can be in.
+
+    ``MERGED`` and ``CLOSED`` are distinct: a PR that was closed without being
+    merged is a different outcome from one a maintainer merged, and SPEC section
+    15 requires the difference to be reported accurately.
+    """
+
+    OPEN = "open"
+    MERGED = "merged"
+    CLOSED = "closed"
+
+
+class ReviewDecision(StrEnum):
+    """The latest review decision on a pull request.
+
+    ``NONE`` means no review has been submitted yet, which is not the same as a
+    review that approved or requested changes.
+    """
+
+    APPROVED = "approved"
+    CHANGES_REQUESTED = "changes_requested"
+    COMMENTED = "commented"
+    DISMISSED = "dismissed"
+    REVIEW_REQUIRED = "review_required"
+    NONE = "none"
+
+
+class PullRequestOutcome(BaseModel):
+    """The real, fetched state of one pull request (SPEC sections 11 and 15).
+
+    Every field comes from the GitHub API or from ForgeFlow's own records. None
+    of them is guessed: an unknown review decision is ``NONE``, and ``pr_url`` is
+    left empty rather than constructed, so a link is only ever shown when GitHub
+    returned it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: int | None = None
+    checked_at: datetime | None = None
+    repo_full_name: str
+    issue_number: int = Field(ge=1)
+    pr_number: int = Field(ge=1)
+    pr_url: str = ""
+    status: PullRequestStatus
+    draft: bool = True
+    merged: bool = False
+    merged_at: datetime | None = None
+    closed_at: datetime | None = None
+    review_decision: ReviewDecision = ReviewDecision.NONE
+    # Number of review submissions plus inline review comments. Named
+    # ``review_comments`` because it counts things a maintainer wrote, not
+    # things ForgeFlow did.
+    review_comments: int = Field(default=0, ge=0)
+    # Reviews whose state was CHANGES_REQUESTED.
+    requested_changes: int = Field(default=0, ge=0)
+    approvals: int = Field(default=0, ge=0)
+    # Failing or errored validation checks recorded for this task's patch.
+    failures: int = Field(default=0, ge=0)
+    # Recorded model spend for this task, in US dollars.
+    cost_usd: float = Field(default=0.0, ge=0.0)
+
+    @field_validator("repo_full_name")
+    @classmethod
+    def _check_full_name(cls, value: str) -> str:
+        return _validate_repo_full_name(value)
+
+
+class ReviewRecord(BaseModel):
+    """One pull-request review submission, as returned by GitHub.
+
+    Stored per review id so re-tracking a PR updates the row instead of
+    appending a duplicate. ``body`` is untrusted maintainer text; it is stored
+    verbatim and never interpreted as an instruction.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: int | None = None
+    repo_full_name: str
+    issue_number: int = Field(ge=1)
+    pr_number: int = Field(ge=1)
+    review_id: int = Field(ge=1)
+    author: str = ""
+    state: str = ""
+    submitted_at: datetime | None = None
+    body: str = ""
+
+
+class OutcomeMetrics(BaseModel):
+    """The SPEC section 11 evaluation fields for one task.
+
+    These are internal measurements, not claims made to a maintainer. Each is a
+    0.0 to 1.0 score, except ``maintainer_feedback`` which holds the maintainer's
+    own words, empty when none were given.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: int | None = None
+    computed_at: datetime | None = None
+    repo_full_name: str
+    issue_number: int = Field(ge=1)
+    patch_usefulness: float = Field(ge=0.0, le=1.0)
+    test_quality: float = Field(ge=0.0, le=1.0)
+    complexity: float = Field(ge=0.0, le=1.0)
+    maintainer_feedback: str = ""
+
+    @field_validator("repo_full_name")
+    @classmethod
+    def _check_full_name(cls, value: str) -> str:
+        return _validate_repo_full_name(value)

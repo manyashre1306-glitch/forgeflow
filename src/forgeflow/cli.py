@@ -18,7 +18,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from forgeflow import approval, audit, killswitch
+from forgeflow import approval, audit, killswitch, outcome_tracker
 from forgeflow import report as report_module
 from forgeflow.agent_runner import AgentUnavailableError, get_agent
 from forgeflow.approval import ApprovalError, storage
@@ -832,6 +832,86 @@ def audit_log(
         conn.close()
 
 
+@app.command()
+def track(
+    issue: Annotated[str, typer.Argument(help="Issue reference, e.g. owner/repo#123.")],
+    db_path: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
+    pr_number: Annotated[
+        int | None, typer.Option("--pr", help="PR number. Defaults to the recorded publication.")
+    ] = None,
+) -> None:
+    """Fetch a published PR's real state and record it (SPEC section 2J).
+
+    Read-only: this uses GITHUB_TOKEN and never the publishing credential. It
+    fetches the PR status, reviews, and review comments, counts recorded
+    validation failures, and stores the result.
+    """
+    repo_full_name, number = parse_issue_reference(issue)
+    conn = open_db(db_path)
+    try:
+        resolved_pr = pr_number
+        if resolved_pr is None:
+            publications = storage.list_publications(conn, repo_full_name, number)
+            published = [p for p in publications if p.published and p.pr_number]
+            if not published:
+                console.print(
+                    f"[yellow]no published PR recorded for {repo_full_name}#{number}[/yellow]"
+                )
+                raise typer.Exit(code=1)
+            resolved_pr = published[-1].pr_number
+
+        try:
+            client = build_client()
+        except ForgeFlowError as exc:
+            console.print(f"[red]error:[/red] {exc}")
+            raise typer.Exit(code=1) from exc
+
+        try:
+            outcome = outcome_tracker.track_pull_request(
+                conn, client, repo_full_name, number, int(resolved_pr)
+            )
+        except (GitHubError, ForgeFlowError) as exc:
+            console.print(f"[red]error:[/red] {exc}")
+            raise typer.Exit(code=1) from exc
+        finally:
+            client.close()
+
+        console.print(f"{repo_full_name}#{number} PR #{outcome.pr_number}: {outcome.status.value}")
+        console.print(f"  url:              {outcome.pr_url}")
+        console.print(f"  draft:            {outcome.draft}")
+        console.print(f"  review decision:  {outcome.review_decision.value}")
+        console.print(f"  review comments:  {outcome.review_comments}")
+        console.print(f"  requested changes: {outcome.requested_changes}")
+        console.print(f"  approvals:        {outcome.approvals}")
+        console.print(f"  recorded failures: {outcome.failures}")
+        console.print(f"  recorded cost:    ${outcome.cost_usd:.6f}")
+    finally:
+        conn.close()
+
+
+@app.command()
+def metrics(
+    db_path: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
+) -> None:
+    """Show the SPEC section 11 evaluation metrics across tracked tasks."""
+    conn = open_db(db_path)
+    try:
+        report = outcome_tracker.metrics_report(conn)
+    finally:
+        conn.close()
+
+    table = Table(title="outcome metrics (SPEC section 11)")
+    table.add_column("metric")
+    table.add_column("value", justify="right")
+    for name in outcome_tracker.SPEC_METRICS:
+        table.add_row(name, f"{report.get(name, 0)}")
+    console.print(table)
+    console.print(
+        "[dim]time_saved_hours is reported as 0.0: it is not measured, and a "
+        "constant estimate would be a fabricated benchmark.[/dim]"
+    )
+
+
 def _approval_common(
     issue: str,
     db_path: Path,
@@ -1155,9 +1235,14 @@ def publish(
 
     mode = PublishMode.REAL if confirm_real_publish else PublishMode.DRY_RUN
     client = None
+    read_client = None
     try:
         if mode is PublishMode.REAL:
             client = build_write_client()
+            # The issue reference is verified with the read-only credential, not
+            # the publishing token. The publishing token is narrow by design and
+            # must not be assumed to have read access to the issues API.
+            read_client = build_client()
         plan = plan_publish(
             conn,
             repo_full_name,
@@ -1165,10 +1250,16 @@ def publish(
             target_branch=target_branch,
             mode=mode,
             client=client,
+            read_client=read_client,
             actor=actor,
         )
     except (PublisherError, ForgeFlowError) as exc:
         console.print(f"[red]error:[/red] {exc}")
+        if read_client is not None:
+            read_client.close()
+        if client is not None:
+            client.close()
+        conn.close()
         raise typer.Exit(code=1) from exc
 
     console.print(plan.render())
@@ -1206,6 +1297,7 @@ def publish(
             target_branch=target_branch,
             mode=PublishMode.REAL,
             client=client,
+            read_client=read_client,
             actor=actor,
         )
     except PublisherError as exc:
@@ -1213,6 +1305,8 @@ def publish(
         raise typer.Exit(code=1) from exc
     finally:
         conn.close()
+        if read_client is not None:
+            read_client.close()
         if client is not None:
             client.close()
 

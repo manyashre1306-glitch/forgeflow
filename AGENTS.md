@@ -63,3 +63,32 @@ Four Phase 2 gaps were closed after the first pass, all in
 
 Current gate state: 508 tests pass, ruff check and format clean.
 
+
+## Phase 4 step 4.3: issue verification fix and outcome tracking (2026-10-24)
+
+Two changes on branch `feat/phase4-controlled-publishing`.
+
+1. **Issue verification uses the read-only token.** The real-mode publish body
+   reported issue #1 as unconfirmed because `publisher._issue_verified` read the
+   issue through the *publishing* client. The publishing token is narrow and the
+   issues API read returned 401, so a real issue looked missing. Fix: reads use
+   the read-only client (`GITHUB_TOKEN`), writes use the write client
+   (`FORGEFLOW_PUBLISH_TOKEN`); the two never cross.
+   - `plan_publish`/`publish` take `read_client: GitHubReadClient | None`; when
+     omitted it falls back to `client`, so single-scope callers are unchanged.
+   - The CLI builds both clients in real mode and closes both.
+   - Regression tests: `tests/test_publisher.py`
+     (`test_real_publish_verifies_the_issue_with_the_read_client`, and the
+     fallback / read-denies cases).
+
+2. **`outcome_tracker.py`** (SPEC sections 2J, 11, 15). Read-only tracking of a
+   published PR: status (open/merged/closed), reviews, requested changes,
+   failures, and cost, in SQLite. It uses only `GITHUB_TOKEN`; it never imports
+   or reads `FORGEFLOW_PUBLISH_TOKEN` and reads no environment itself. Tables
+   `pull_request_outcomes`, `pr_reviews`, `outcome_metrics` are created by
+   `storage.init_db`. CLI: `forgeflow track <ref>` and `forgeflow metrics`.
+   - `time_saved_hours` is reported as `0.0` on purpose: it is not measured, and
+     a constant estimate would be a fabricated benchmark.
+   - `metrics_report()` always returns every key in `SPEC_METRICS`.
+
+Current gate state: 863 tests pass, ruff check and format clean.

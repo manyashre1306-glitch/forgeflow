@@ -332,3 +332,35 @@ class GitHubClient:
                 {"per_page": DEFAULT_PER_PAGE},
             )
         )
+
+    def issue_exists(self, full_name: str, number: int) -> bool:
+        """Whether an issue or PR with this number exists. Read-only.
+
+        Used to verify a referenced issue before a closing keyword is claimed.
+        A 404 is a definite "no"; any other failure is raised so the caller can
+        fail closed rather than treat an error as absence.
+        """
+        try:
+            self._get_json(f"{self._base_url}/repos/{full_name}/issues/{number}")
+        except GitHubError as exc:
+            if "not found" in str(exc):
+                return False
+            raise
+        return True
+
+    def get_pull_request(self, full_name: str, number: int) -> dict[str, Any]:
+        """Fetch one pull request's current state. Read-only."""
+        payload = self._get_json(f"{self._base_url}/repos/{full_name}/pulls/{number}")
+        if not isinstance(payload, dict):
+            raise GitHubError(f"unexpected pull request payload for {full_name}#{number}")
+        return payload
+
+    def list_pull_request_reviews(self, full_name: str, number: int) -> list[dict[str, Any]]:
+        """Fetch every review submission on a pull request. Read-only."""
+        return list(self._paginate(f"{self._base_url}/repos/{full_name}/pulls/{number}/reviews"))
+
+    def list_pull_request_review_comments(
+        self, full_name: str, number: int
+    ) -> list[dict[str, Any]]:
+        """Fetch every inline review comment on a pull request. Read-only."""
+        return list(self._paginate(f"{self._base_url}/repos/{full_name}/pulls/{number}/comments"))
