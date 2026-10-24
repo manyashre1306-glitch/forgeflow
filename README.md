@@ -224,6 +224,7 @@ make clean      # remove caches and the local database
 | [`docs/cost-controls.md`](docs/cost-controls.md) | budgets, caps, and how to verify current vendor pricing |
 | [`docs/setup.md`](docs/setup.md) | the full local walkthrough |
 | [`docs/demonstration.md`](docs/demonstration.md) | the offline dry-run demo and what it does not claim |
+| [`docs/spec-audit.md`](docs/spec-audit.md) | a requirement-by-requirement audit of SPEC sections 1–16, with evidence |
 
 ## Evaluation
 
