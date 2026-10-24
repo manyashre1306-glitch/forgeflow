@@ -142,10 +142,96 @@ reason, combined into a weighted total on a 0 to 100 scale:
 
 Weights are configurable in `config/repositories.yaml` and must sum to 1.0.
 
+### Outcome-driven adjustment (off by default)
+
+SPEC section 11 asks tracked PR results to improve future ranking. ForgeFlow
+adds a **small, capped** adjustment on top of the weighted total, controlled by
+`outcome_ranking` in `config/repositories.yaml`:
+
+- It is **off by default** (`enabled: false`). With it off, ranking is exactly
+  the six factors above.
+- It can move an issue by at most `max_adjustment_points` (default 3.0 points on
+  the 0-100 scale), far less than any single factor's weight.
+- It rewards maintainer **engagement**, not contribution count. A merge weighs
+  most, an approval less, and a maintainer requesting changes still counts
+  positively, because that is a real signal the task was worth doing. A PR closed
+  with no engagement lowers the score slightly.
+- Only the most recent `lookback` outcomes per repository count.
+
+Track outcomes with `uv run forgeflow track <owner/repo#N>` and see the SPEC
+section 11 metrics with `uv run forgeflow metrics`. `time_saved_hours` is
+reported as 0.0 on purpose: it is not measured, and a constant estimate would be
+a fabricated benchmark.
+
 > **Caveat.** These scores are initial heuristics, **not proven predictors of PR
 > acceptance**. A high score means an issue matched the configured signals; it
 > does not mean the issue is suitable. Always check the issue's current state and
 > the repository's contribution instructions before starting work.
+
+## Publishing
+
+Publishing is the only part of ForgeFlow that writes to GitHub, and it is
+guarded. It needs a **separate** token, `FORGEFLOW_PUBLISH_TOKEN`, that never
+falls back to `GITHUB_TOKEN`; the read path and the write path use different
+credentials on purpose (SPEC sections 8 and 9).
+
+```bash
+# Preview what would be published. No write happens (dry run is the default).
+uv run forgeflow publish pydantic/pydantic#1234
+
+# Approve the latest patch, then publish for real. The approval binds to the
+# SHA-256 of that exact diff.
+uv run forgeflow approve pydantic/pydantic#1234 --reason "looks correct"
+uv run forgeflow publish pydantic/pydantic#1234 --confirm-real-publish
+```
+
+What the real-mode publish does, in order, and how it fails:
+
+- **Approval.** It requires a recorded approval bound to the SHA-256 of the
+  exact diff. If the patch changed, the approval no longer matches and publishing
+  refuses. There is no force flag.
+- **Validation.** A failed or errored check blocks publishing unless a documented
+  `validation-exception` authorizes that exact patch hash.
+- **Issue verification.** It checks the issue exists using the **read-only**
+  client, never the publishing token. Only a verified issue lets the PR body
+  claim `Fixes #N`; an unverified reference (deleted, renamed, private, or a
+  denied read) is labelled unverified in the body instead of being asserted. A
+  closing keyword that points nowhere would be a false claim, so it is not made.
+- **Missing token.** A missing `FORGEFLOW_PUBLISH_TOKEN` fails closed with a
+  clean one-line error, never a traceback and never a fallback to `GITHUB_TOKEN`.
+- **Draft by default.** The PR is opened as a draft where the API supports it.
+  ForgeFlow never auto-merges and never force-pushes.
+
+## Scheduling (discovery only, off by default)
+
+SPEC section 13 says to add scheduling only after manual runs are reliable.
+ForgeFlow therefore ships an **optional, discovery-only** schedule:
+
+```bash
+# Show the schedule state (disabled by default).
+uv run forgeflow schedule
+
+# Run one discovery cycle now, if it is due.
+uv run forgeflow schedule --run
+```
+
+Rules that make this safe:
+
+- **Discovery only.** The scheduler can run exactly one command, `discover`.
+  There is no code path from the scheduler to publishing, validation, or a model
+  call, and a test asserts it imports neither the publisher nor the token module.
+- **Off by default.** Set `schedule.enabled: true` in `config/repositories.yaml`
+  to turn it on. Nothing runs on a timer until you do.
+- **No daemon.** There is no background thread or loop. A cycle runs only when a
+  caller invokes `forgeflow schedule --run` and the interval has elapsed, so
+  behaviour stays observable.
+- **Kill switch honoured.** An engaged kill switch refuses the cycle before any
+  GitHub client is built.
+
+> **Turn scheduling on only after manual runs are reliable.** Run discovery,
+> ranking, analysis, validation, and publishing by hand until each is dependable,
+> then enable the schedule. Never schedule publishing: every external write needs
+> explicit human approval (SPEC section 8), which a timer cannot give.
 
 ## Data
 

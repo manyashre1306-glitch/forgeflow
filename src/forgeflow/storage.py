@@ -234,12 +234,13 @@ def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
     conn.commit()
     # Phase 3 tables live in their own modules so each owns its schema.
-    from forgeflow import approval, audit, killswitch, outcome_tracker
+    from forgeflow import approval, audit, killswitch, outcome_tracker, scheduler
 
     audit.ensure_schema(conn)
     killswitch.ensure_schema(conn)
     approval.ensure_schema(conn)
     outcome_tracker.ensure_schema(conn)
+    scheduler.ensure_schema(conn)
 
 
 def upsert_repository(conn: sqlite3.Connection, repo: Repository) -> None:

@@ -107,10 +107,16 @@ all rather than falling back to the host.
 - `killswitch.TaskGuard` enforces per-task ceilings on wall-clock time,
   attempts, tokens, and cost, and fails closed: once a limit is reached every
   further check raises.
+- The optional scheduler (SPEC section 13) runs **discovery only**, at most once
+  per configured interval, and holds no background thread or loop. There is no
+  timer that keeps firing on its own, and no scheduled path to publishing.
 
 **Residual risk.** The repair cap is enforced by the caller consulting
 `can_repair()`; it is not a hard runtime interrupt. A future orchestration loop
-must call it on every iteration.
+must call it on every iteration. The scheduler's "at most once per interval"
+guarantee depends on the caller invoking `forgeflow schedule --run`; a caller
+that invokes it in a tight loop still cannot publish, because the scheduler's
+allowed command set is `{"discover"}`.
 
 ### 5. Excessive API calls and runaway spending
 
@@ -174,6 +180,29 @@ one. Phase 3 stores approvals with their timestamp and hash.
 The check must be repeated at publish time in Phase 4, immediately before the
 external write, since the patch could change between approval and publishing.
 
+### 9. Gaming the outcome metric
+
+**Threat.** SPEC section 11 records PR outcomes to improve ranking. If the
+adjustment rewarded volume, ForgeFlow could be pushed to open many low-quality
+PRs, or to optimise for merge count alone and ignore useful review feedback.
+
+**Mitigation.**
+
+- The adjustment is **small and capped**: at most `max_adjustment_points`
+  (default 3.0 on a 0-100 scale), less than any single factor's weight, so it can
+  nudge but never dominate the six spec factors.
+- It rewards maintainer **engagement**, not count. A maintainer requesting
+  changes still counts positively, so the signal does not collapse to "merges
+  only".
+- It is **off by default**, and only the most recent `lookback` outcomes count,
+  so old history cannot accumulate into a large effect.
+- The base six-factor score is unchanged; the adjustment is a separate, visible
+  field in the report and CLI, so a reader can always see the heuristic score.
+
+**Residual risk.** The adjustment is still a heuristic built on a small sample
+of one operator's PRs. It is off by default and should stay off until there are
+enough real tracked outcomes to judge whether the nudge behaves sensibly.
+
 ## Kill switch
 
 Three independent sources, any one sufficient to stop all model calls and
@@ -189,7 +218,8 @@ check and before the isolation check, so it stops a run in both cases.
 
 ## Not implemented, and why
 
-- **No publishing of any kind.** Phase 4.
+- **No automatic publishing of any kind.** Publishing is always a manual,
+  approved action (SPEC section 8). The scheduler runs discovery only.
 - **No container runtime in this environment**, so no repository code executes.
   Recorded honestly in every validation report rather than assumed away.
 - **No external audit sink.** The append-only guarantee is local to the SQLite

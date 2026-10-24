@@ -18,7 +18,7 @@ from pathlib import Path
 
 from forgeflow.dedupe import DroppedIssue
 from forgeflow.models import DEFAULT_WEIGHTS, SCORE_FACTORS, RankedIssue
-from forgeflow.ranking import total_for
+from forgeflow.ranking import adjusted_total, total_for
 
 # The caveat is required by SPEC section 5 and is emitted in every report.
 HEURISTIC_CAVEAT = (
@@ -85,7 +85,7 @@ def render_report(
     else:
         for entry in ranked:
             issue = entry.issue
-            total = total_for(entry.score, active_weights)
+            total = adjusted_total(entry.score, active_weights, entry.outcome_adjustment)
             lines.extend(
                 [
                     f"### {entry.rank}. {issue.repo_full_name}#{issue.number}",
@@ -101,6 +101,13 @@ def render_report(
                     "| --- | ---: | ---: | ---: | --- |",
                 ]
             )
+            if entry.outcome_adjustment:
+                base_total = total_for(entry.score, active_weights)
+                lines.append(
+                    f"- **Outcome adjustment:** {entry.outcome_adjustment:+.2f} points "
+                    f"(from tracked PR history; base {base_total:.2f}, "
+                    f"capped and off by default per SPEC section 11)"
+                )
             for factor in SCORE_FACTORS:
                 value = float(getattr(entry.score, factor))
                 weight = active_weights.get(factor, 0.0)

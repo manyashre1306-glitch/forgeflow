@@ -67,6 +67,57 @@ class LLMConfig(BaseModel):
         return [m for m in (self.triage_model, self.analysis_model) if m not in self.pricing]
 
 
+class OutcomeRankingConfig(BaseModel):
+    """How tracked PR outcomes nudge ranking (SPEC section 11).
+
+    This is deliberately small and capped. The point of SPEC section 11 is to
+    "improve future issue ranking" without "optimizing only for contribution
+    count or merge rate", so the adjustment:
+
+    * is off by default (``enabled: false``), so ranking is unchanged until a
+      human turns it on;
+    * can move an issue by at most ``max_adjustment_points`` on the 0-100 scale,
+      which is far smaller than the weight of any single factor;
+    * rewards maintainer engagement — approvals and merges count, but so does a
+      maintainer who requested changes, because that is also a real signal that
+      the task was worth doing. A PR closed with no engagement does not help.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    # Hard ceiling on the points this adjustment may add or remove. Small by
+    # design: a large value would let history dominate the six spec factors.
+    max_adjustment_points: float = Field(default=3.0, ge=0.0, le=10.0)
+    # Points per merged PR, per approval, and per changes-requested, before the
+    # cap is applied. Merges weigh most, but they are not the only signal.
+    points_per_merge: float = Field(default=1.5, ge=0.0, le=5.0)
+    points_per_approval: float = Field(default=1.0, ge=0.0, le=5.0)
+    points_per_changes_requested: float = Field(default=0.5, ge=0.0, le=5.0)
+    # A repository whose PRs were closed without engagement is a weaker
+    # prospect; this is the per-close penalty, capped with the rest.
+    points_per_closed_unmerged: float = Field(default=-0.5, ge=-5.0, le=0.0)
+    # Only the most recent outcomes count, so ancient history cannot dominate.
+    lookback: int = Field(default=20, ge=1, le=200)
+
+
+class ScheduleConfig(BaseModel):
+    """Optional scheduled discovery (SPEC section 13, Phase 4).
+
+    Off by default. When enabled, the only thing a cycle may do is run
+    discovery. Publishing is never scheduled: SPEC section 8 requires an explicit
+    human approval for every external write, and a timer cannot supply one.
+
+    Enable this only after manual discovery, ranking, analysis, validation, and
+    publishing have all proved reliable by hand. See the README.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    interval_minutes: int = Field(default=360, ge=5, le=10080)
+
+
 class AppConfig(BaseModel):
     """Validated contents of ``config/repositories.yaml``."""
 
@@ -79,6 +130,8 @@ class AppConfig(BaseModel):
     opt_out_labels: list[str] = Field(default_factory=list)
     preferred_labels: list[str] = Field(default_factory=list)
     llm: LLMConfig = Field(default_factory=lambda: LLMConfig())
+    outcome_ranking: OutcomeRankingConfig = Field(default_factory=lambda: OutcomeRankingConfig())
+    schedule: ScheduleConfig = Field(default_factory=lambda: ScheduleConfig())
     kill_switch: bool = False
 
     @field_validator("repositories")

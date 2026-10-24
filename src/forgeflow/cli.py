@@ -18,7 +18,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from forgeflow import approval, audit, killswitch, outcome_tracker
+from forgeflow import approval, audit, killswitch, outcome_tracker, scheduler
 from forgeflow import report as report_module
 from forgeflow.agent_runner import AgentUnavailableError, get_agent
 from forgeflow.approval import ApprovalError, storage
@@ -61,7 +61,7 @@ from forgeflow.publisher import (
     plan_publish,
 )
 from forgeflow.publisher import publish as publish_patch
-from forgeflow.ranking import rank_issues, resolve_weights, total_for
+from forgeflow.ranking import adjusted_total, rank_issues, resolve_weights
 from forgeflow.repository_context import (
     RepositoryContextError,
     list_workspaces,
@@ -202,17 +202,33 @@ def run_discover(
 
 
 def run_rank(db_path: Path, config: AppConfig | None = None) -> list:
-    """Rank stored issues, persist the scores, and return the ranked list."""
+    """Rank stored issues, persist the scores, and return the ranked list.
+
+    Tracked PR outcomes are supplied when the adjustment is enabled in config,
+    so a repository with real, engaged-with history gets a small, capped nudge.
+    """
     conn = open_db(db_path)
     try:
         issues = storage.list_issues(conn)
         repositories = {repo.full_name: repo for repo in storage.list_repositories(conn)}
-        ranked = rank_issues(issues, config, repositories)
+        outcomes = _outcome_stats_for_ranking(conn, config)
+        ranked = rank_issues(issues, config, repositories, outcomes=outcomes)
         for entry in ranked:
             storage.upsert_issue_score(conn, entry.score)
         return ranked
     finally:
         conn.close()
+
+
+def _outcome_stats_for_ranking(conn, config: AppConfig | None):
+    """Outcome stats for ranking, or None when the adjustment is disabled.
+
+    Returning None when disabled keeps the ranking path free of an outcome
+    lookup in the common case, and makes "off" mean exactly "unchanged".
+    """
+    if config is None or not config.outcome_ranking.enabled:
+        return None
+    return outcome_tracker.outcome_stats_by_repo(conn, lookback=config.outcome_ranking.lookback)
 
 
 def run_report(
@@ -226,7 +242,8 @@ def run_report(
     try:
         issues = storage.list_issues(conn)
         repositories = {repo.full_name: repo for repo in storage.list_repositories(conn)}
-        ranked = rank_issues(issues, config, repositories)
+        outcomes = _outcome_stats_for_ranking(conn, config)
+        ranked = rank_issues(issues, config, repositories, outcomes=outcomes)
         for entry in ranked:
             storage.upsert_issue_score(conn, entry.score)
         weights = resolve_weights(config)
@@ -339,6 +356,78 @@ def discover(
 
 
 @app.command()
+def schedule(
+    config_path: Annotated[Path, typer.Option("--config", "-c")] = DEFAULT_CONFIG_PATH,
+    db_path: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
+    limit: Annotated[
+        int, typer.Option("--limit", "-n", help="Maximum issues to fetch per repository.")
+    ] = 100,
+    run: Annotated[
+        bool, typer.Option("--run", help="Run one discovery cycle now if it is due.")
+    ] = False,
+) -> None:
+    """Show or run the optional scheduled DISCOVERY cycle (SPEC section 13).
+
+    Discovery only. Publishing is never scheduled: every external write needs
+    explicit human approval (SPEC section 8). Off by default; enable it in the
+    config only after manual runs are reliable. This command does not daemonise
+    or loop; with --run it performs at most one cycle and exits.
+    """
+    try:
+        config = load_app_config(config_path)
+    except ForgeFlowError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    console.print(scheduler.describe_schedule(config.schedule))
+    if not run:
+        console.print(
+            "[dim]Pass --run to perform one discovery cycle if it is due. "
+            "Nothing runs on a timer by itself.[/dim]"
+        )
+        return
+
+    conn = open_db(db_path)
+    try:
+
+        def _discover() -> str:
+            with build_client() as client:
+                result = run_discover(
+                    client,
+                    config,
+                    db_path,
+                    per_repo_limit=limit,
+                    detect_tests=True,
+                    fetch_linked_prs=True,
+                )
+            return f"discovered {len(result.issues)} issue(s)"
+
+        def _kill_switch_engaged() -> bool:
+            return config.kill_switch or killswitch.read_state(conn).engaged
+
+        try:
+            outcome = scheduler.run_due(
+                conn,
+                config.schedule,
+                discover=_discover,
+                kill_switch_engaged=_kill_switch_engaged,
+            )
+        except (scheduler.ScheduleError, ForgeFlowError) as exc:
+            console.print(f"[red]error:[/red] {exc}")
+            raise typer.Exit(code=1) from exc
+        except GitHubError as exc:
+            console.print(f"[red]GitHub error:[/red] {exc}")
+            raise typer.Exit(code=1) from exc
+    finally:
+        conn.close()
+
+    if outcome.ran:
+        console.print(f"ran scheduled {outcome.command}: {outcome.detail}")
+    else:
+        console.print(f"did not run: {outcome.reason}")
+
+
+@app.command()
 def rank(
     config_path: Annotated[Path, typer.Option("--config", "-c")] = DEFAULT_CONFIG_PATH,
     db_path: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
@@ -362,16 +451,22 @@ def rank(
     table.add_column("#", justify="right")
     table.add_column("Issue")
     table.add_column("Total", justify="right")
+    table.add_column("Outcome", justify="right")
     table.add_column("Title", overflow="fold")
     for entry in ranked[:top]:
         table.add_row(
             str(entry.rank),
             f"{entry.issue.repo_full_name}#{entry.issue.number}",
-            f"{total_for(entry.score, weights):.2f}",
+            f"{adjusted_total(entry.score, weights, entry.outcome_adjustment):.2f}",
+            f"{entry.outcome_adjustment:+.2f}" if entry.outcome_adjustment else "-",
             entry.issue.title,
         )
     console.print(table)
     console.print("[dim]Scores are initial heuristics, not predictors of PR acceptance.[/dim]")
+    console.print(
+        "[dim]Outcome column is a small, capped history nudge, off by default "
+        "(config outcome_ranking.enabled).[/dim]"
+    )
 
 
 @app.command()

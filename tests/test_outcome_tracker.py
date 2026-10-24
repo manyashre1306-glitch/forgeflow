@@ -477,3 +477,52 @@ def test_schema_is_created_by_init_db(conn) -> None:
         row["name"] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
     }
     assert {"pull_request_outcomes", "pr_reviews", "outcome_metrics"} <= names
+
+
+# ==========================================================================
+# Outcome history feeding the ranking adjustment (SPEC section 11)
+# ==========================================================================
+
+
+def _record_outcome(conn, *, status, merged=False, approvals=0, requested_changes=0, pr=PR):
+    from forgeflow.models import PullRequestOutcome
+
+    outcome_tracker.record_outcome(
+        conn,
+        PullRequestOutcome(
+            repo_full_name=REPO,
+            issue_number=ISSUE,
+            pr_number=pr,
+            status=status,
+            merged=merged,
+            approvals=approvals,
+            requested_changes=requested_changes,
+        ),
+    )
+
+
+def test_outcome_stats_counts_engagement(conn) -> None:
+    seed_task(conn)
+    _record_outcome(conn, status=PullRequestStatus.MERGED, merged=True, pr=1)
+    _record_outcome(conn, status=PullRequestStatus.OPEN, approvals=1, pr=2)
+    _record_outcome(conn, status=PullRequestStatus.OPEN, requested_changes=1, pr=3)
+    _record_outcome(conn, status=PullRequestStatus.CLOSED, pr=4)
+
+    stats = outcome_tracker.outcome_stats_by_repo(conn)[REPO]
+    assert stats.total == 4
+    assert stats.merged == 1
+    assert stats.approvals == 1
+    assert stats.changes_requested == 1
+    assert stats.closed_unmerged == 1
+
+
+def test_outcome_stats_absent_for_untracked_repo(conn) -> None:
+    assert outcome_tracker.outcome_stats_by_repo(conn) == {}
+
+
+def test_outcome_stats_lookback_limits_history(conn) -> None:
+    seed_task(conn)
+    for pr in range(1, 6):
+        _record_outcome(conn, status=PullRequestStatus.MERGED, merged=True, pr=pr)
+    stats = outcome_tracker.outcome_stats_by_repo(conn, lookback=2)[REPO]
+    assert stats.total == 2

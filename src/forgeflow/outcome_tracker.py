@@ -7,9 +7,9 @@ exactly that and nothing else.
 Two rules define it:
 
 * **Read-only.** It talks to GitHub only through the read-only client, which is
-  constructed from ``GITHUB_TOKEN``. It never imports or reads
-  ``FORGEFLOW_PUBLISH_TOKEN``; the publishing credential is not needed to read a
-  pull request's state, so it is not present. ``tests/test_publish_isolation.py``
+  constructed from ``GITHUB_TOKEN``. It never imports or reads the publishing
+  credential environment variable; that credential is not needed to read a pull
+  request's state, so it is not present. ``tests/test_publish_isolation.py``
   enforces that.
 * **Factual.** Every stored value comes from the GitHub API or from ForgeFlow's
   own records. A status is never guessed, and a review decision with no reviews
@@ -32,6 +32,7 @@ from forgeflow.models import (
     ReviewDecision,
     ReviewRecord,
 )
+from forgeflow.ranking import RepoOutcomeStats
 
 
 class OutcomeReader(Protocol):
@@ -676,3 +677,53 @@ def _security_incidents(conn: sqlite3.Connection) -> int:
     """
     row = conn.execute("SELECT COUNT(*) AS n FROM audit_log WHERE severity = 'critical'").fetchone()
     return int(row["n"]) if row else 0
+
+
+# --------------------------------------------------------------------------
+# Outcome history for ranking (SPEC section 11)
+# --------------------------------------------------------------------------
+
+
+def outcome_stats_by_repo(
+    conn: sqlite3.Connection,
+    *,
+    lookback: int = 20,
+) -> dict[str, RepoOutcomeStats]:
+    """Aggregate tracked outcomes per repository, for the ranking adjustment.
+
+    Only the most recent ``lookback`` rows per repository count, so old history
+    cannot dominate. This reads ForgeFlow's own records; it performs no network
+    access and touches no credential.
+    """
+    stats: dict[str, RepoOutcomeStats] = {}
+    repos = [
+        row["repo_full_name"]
+        for row in conn.execute("SELECT DISTINCT repo_full_name FROM pull_request_outcomes")
+    ]
+    for repo_full_name in repos:
+        rows = conn.execute(
+            """
+            SELECT status, merged, approvals, requested_changes
+            FROM pull_request_outcomes
+            WHERE repo_full_name = ?
+            ORDER BY checked_at DESC, id DESC
+            LIMIT ?
+            """,
+            (repo_full_name, lookback),
+        ).fetchall()
+        merged = sum(1 for row in rows if row["merged"])
+        approvals = sum(1 for row in rows if row["approvals"] > 0)
+        changes_requested = sum(1 for row in rows if row["requested_changes"] > 0)
+        closed_unmerged = sum(
+            1
+            for row in rows
+            if row["status"] == PullRequestStatus.CLOSED.value and not row["merged"]
+        )
+        stats[repo_full_name] = RepoOutcomeStats(
+            merged=merged,
+            approvals=approvals,
+            changes_requested=changes_requested,
+            closed_unmerged=closed_unmerged,
+            total=len(rows),
+        )
+    return stats

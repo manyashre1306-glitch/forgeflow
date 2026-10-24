@@ -250,6 +250,11 @@ class RankedIssue(BaseModel):
     issue: Issue
     score: IssueScore
     rank: int = Field(ge=1)
+    # A small, capped correction from tracked PR outcomes for this repository
+    # (SPEC section 11: "to improve future issue ranking"). Points on the same
+    # 0-100 scale as the weighted total. Zero when no outcomes were supplied, so
+    # a ranking with no history is unchanged. Bounded by the configured cap.
+    outcome_adjustment: float = 0.0
 
     @model_validator(mode="after")
     def _check_score_matches_issue(self) -> RankedIssue:

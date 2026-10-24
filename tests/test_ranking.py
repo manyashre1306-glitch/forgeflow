@@ -13,7 +13,10 @@ import pytest
 from forgeflow.config import AppConfig
 from forgeflow.models import DEFAULT_WEIGHTS, SCORE_FACTORS, Issue, Repository
 from forgeflow.ranking import (
+    RepoOutcomeStats,
+    adjusted_total,
     explain,
+    outcome_adjustment,
     rank_issues,
     resolve_weights,
     score_duplicate_conflict_risk,
@@ -443,3 +446,127 @@ def test_explain_includes_every_factor_and_total() -> None:
     assert "/100" in text
     for factor in SCORE_FACTORS:
         assert factor in text
+
+
+# --- outcome-driven adjustment (SPEC section 11) ----------------------------
+
+
+def outcome_config(**overrides) -> AppConfig:
+    data = {
+        "repositories": [REPO],
+        "weights": dict(DEFAULT_WEIGHTS),
+        "skill_keywords": SKILL_KEYWORDS,
+        "outcome_ranking": {"enabled": True, **overrides},
+    }
+    return AppConfig(**data)
+
+
+def test_adjustment_is_off_by_default() -> None:
+    """A ranking with no outcomes configured is unchanged (the default)."""
+    ranked = rank_issues([make_issue()], make_config(), {REPO: make_repo()}, now=NOW)
+    assert ranked[0].outcome_adjustment == 0.0
+
+
+def test_disabled_config_ignores_supplied_outcomes() -> None:
+    stats = RepoOutcomeStats(merged=5, approvals=5, total=10)
+    ranked = rank_issues(
+        [make_issue()],
+        make_config(),
+        {REPO: make_repo()},
+        now=NOW,
+        outcomes={REPO: stats},
+    )
+    assert ranked[0].outcome_adjustment == 0.0
+
+
+def test_enabled_adjustment_rewards_engagement() -> None:
+    stats = RepoOutcomeStats(merged=1, approvals=1, total=2)
+    adjustment = outcome_adjustment(outcome_config(), stats)
+    assert adjustment > 0.0
+
+
+def test_changes_requested_also_counts() -> None:
+    """SPEC 11: do not optimize only for merge count."""
+    only_changes = RepoOutcomeStats(changes_requested=2, total=2)
+    assert outcome_adjustment(outcome_config(), only_changes) > 0.0
+
+
+def test_merge_outranks_approval_but_both_are_positive() -> None:
+    cfg = outcome_config()
+    merged = outcome_adjustment(cfg, RepoOutcomeStats(merged=1, total=1))
+    approved = outcome_adjustment(cfg, RepoOutcomeStats(approvals=1, total=1))
+    assert merged > approved > 0.0
+
+
+def test_adjustment_is_capped() -> None:
+    """A long history cannot dominate the six spec factors."""
+    cfg = outcome_config(max_adjustment_points=3.0)
+    huge = RepoOutcomeStats(merged=1000, approvals=1000, total=2000)
+    assert outcome_adjustment(cfg, huge) == pytest.approx(3.0)
+
+
+def test_negative_adjustment_is_capped_too() -> None:
+    cfg = outcome_config(max_adjustment_points=3.0)
+    many_closed = RepoOutcomeStats(closed_unmerged=1000, total=1000)
+    assert outcome_adjustment(cfg, many_closed) == pytest.approx(-3.0)
+
+
+def test_no_history_means_no_adjustment() -> None:
+    assert outcome_adjustment(outcome_config(), None) == 0.0
+    assert outcome_adjustment(outcome_config(), RepoOutcomeStats()) == 0.0
+
+
+def test_adjustment_is_per_repository() -> None:
+    """Issues in one repository all get the same nudge."""
+    issues = [make_issue(1), make_issue(2)]
+    repos = {REPO: make_repo()}
+    base = rank_issues(issues, outcome_config(), repos, now=NOW)
+    stats = {REPO: RepoOutcomeStats(merged=50, approvals=50, total=100)}
+    nudged = rank_issues(issues, outcome_config(), repos, now=NOW, outcomes=stats)
+    # Both issues share a repository, so both get the same nudge and the relative
+    # order is unchanged. This proves the nudge is per-repository, not per-issue.
+    assert [e.issue.number for e in nudged] == [e.issue.number for e in base]
+    assert {e.outcome_adjustment for e in nudged} == {3.0}
+
+
+def test_adjustment_can_reorder_across_repositories() -> None:
+    """A capped nudge can lift a weaker repository above a stronger one."""
+    strong = "pydantic/pydantic"
+    weak = "acme/small-lib"
+    strong_issue = make_issue(1, repo_full_name=strong)
+    weak_issue = make_issue(2, repo_full_name=weak)
+    repos = {strong: make_repo(), weak: make_repo(stars=50, open_issues=2)}
+    base = rank_issues([strong_issue, weak_issue], outcome_config(), repos, now=NOW)
+    assert base[0].issue.repo_full_name == strong  # the strong repo ranks first
+
+    # Give the weak repo a strong history; the capped nudge should lift it.
+    stats = {weak: RepoOutcomeStats(merged=50, approvals=50, total=100)}
+    nudged = rank_issues(
+        [strong_issue, weak_issue], outcome_config(), repos, now=NOW, outcomes=stats
+    )
+    assert nudged[0].issue.repo_full_name == weak
+    assert nudged[0].outcome_adjustment == 3.0
+
+
+def test_adjustment_appears_in_the_adjusted_total() -> None:
+    score = score_issue(make_issue(), outcome_config(), make_repo(), now=NOW)
+    base = total_for(score, DEFAULT_WEIGHTS)
+    assert adjusted_total(score, DEFAULT_WEIGHTS, 2.0) == pytest.approx(base + 2.0, abs=1e-4)
+
+
+def test_adjusted_total_never_goes_negative() -> None:
+    score = score_issue(make_issue(), outcome_config(), make_repo(), now=NOW)
+    assert adjusted_total(score, DEFAULT_WEIGHTS, -1000.0) == 0.0
+
+
+def test_adjustment_does_not_change_the_base_score() -> None:
+    """The six factor scores are untouched; the nudge is a separate field."""
+    score = score_issue(make_issue(), outcome_config(), make_repo(), now=NOW)
+    ranked = rank_issues(
+        [make_issue()],
+        outcome_config(),
+        {REPO: make_repo()},
+        now=NOW,
+        outcomes={REPO: RepoOutcomeStats(merged=50, total=50)},
+    )
+    assert ranked[0].score == score

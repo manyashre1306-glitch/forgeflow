@@ -85,7 +85,16 @@ def test_discovery_module_has_no_publish_token_reference() -> None:
 
 @pytest.mark.parametrize(
     "module_name",
-    ["discovery", "issue_analyzer", "agent_runner", "sandbox", "repository_context", "ranking"],
+    [
+        "discovery",
+        "issue_analyzer",
+        "agent_runner",
+        "sandbox",
+        "repository_context",
+        "ranking",
+        "outcome_tracker",
+        "scheduler",
+    ],
 )
 def test_untrusted_input_modules_cannot_reach_the_token(module_name: str) -> None:
     """Modules that touch repository or model content must not import it.

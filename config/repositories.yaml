@@ -107,3 +107,35 @@ llm:
 # sandbox execution. FORGEFLOW_KILL_SWITCH=1 in the environment does the same
 # thing, so the system can be stopped without editing this file.
 kill_switch: false
+
+# Outcome-driven ranking adjustment (SPEC section 11). This lets tracked PR
+# results nudge future rankings. It is OFF by default and deliberately small:
+# the adjustment can move an issue by at most max_adjustment_points on the
+# 0-100 scale, far less than any single factor's weight.
+#
+# It rewards maintainer engagement, not contribution count. Merges weigh most,
+# but an approval and even a changes-requested count, because a maintainer who
+# engaged with the work is a real signal. A PR closed with no engagement lowers
+# the score slightly. Leave enabled: false until you have real tracked outcomes
+# and have checked that the nudge behaves the way you want.
+outcome_ranking:
+  enabled: false
+  max_adjustment_points: 3.0
+  points_per_merge: 1.5
+  points_per_approval: 1.0
+  points_per_changes_requested: 0.5
+  points_per_closed_unmerged: -0.5
+  lookback: 20
+
+# Optional scheduled DISCOVERY (SPEC section 13, Phase 4). OFF by default.
+#
+# This schedules discovery only. Publishing is never scheduled: every external
+# write needs explicit human approval (SPEC section 8), and a timer cannot give
+# one. There is no background daemon; a cycle runs only when a caller invokes
+# `forgeflow schedule --run` and the interval has elapsed.
+#
+# Turn this on only after manual discovery, ranking, analysis, validation, and
+# publishing have all proved reliable by hand. See the README.
+schedule:
+  enabled: false
+  interval_minutes: 360
