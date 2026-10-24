@@ -29,6 +29,20 @@ def test_shipped_config_has_opt_out_labels() -> None:
     assert "no-bot" in config.opt_out_labels
 
 
+def test_shipped_config_models_are_priced() -> None:
+    """The shipped config must name models the API can reach, each with a price.
+
+    An unpriced model silently reports $0.00 spend, and a model the API rejects
+    breaks the analyze step outright, so both are checked against the real file.
+    """
+    config = load_config("config/repositories.yaml")
+    assert config.llm.triage_model == "gemini-3.5-flash-lite"
+    assert config.llm.analysis_model == "gemini-3.6-flash"
+    assert config.llm.unknown_models() == []
+    assert config.llm.pricing_for("gemini-3.5-flash-lite").input_per_million == 0.30
+    assert config.llm.pricing_for("gemini-3.6-flash").output_per_million == 3.75
+
+
 def test_shipped_config_has_exclude_labels() -> None:
     config = load_config("config/repositories.yaml")
     assert "duplicate" in config.exclude_labels

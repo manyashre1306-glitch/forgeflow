@@ -85,23 +85,33 @@ preferred_labels:
 # Phase 2 model configuration. No secrets belong in this file; the API key is
 # read from GEMINI_API_KEY in the environment.
 #
-# Pricing is deliberately left at 0.0 rather than filled with guessed numbers.
-# A wrong constant would silently corrupt every cost figure, so set these from
-# the vendor's current published pricing before trusting any spend report.
+# Model names must be ones the API key can actually reach. The previous names
+# (gemini-2.5-flash, gemini-2.5-pro) are still listed in the models endpoint
+# but Google now limits the 2.5 family to accounts that already used them, so a
+# fresh key gets HTTP 404. Verified working against the live generateContent
+# endpoint on 2026-10-24.
+#
+# Pricing is from the official pricing page, quoted here so a stale number is
+# easy to spot:
+#   source: https://ai.google.dev/gemini-api/docs/pricing
+#   retrieved: 2026-10-24
+#   gemini-3.5-flash-lite: input $0.30, output $2.50 per 1M tokens
+#   gemini-3.6-flash:      input $0.75, output $3.75 per 1M tokens
+#                          (both double on 2027-01-01; re-check before then)
 llm:
-  triage_model: gemini-2.5-flash
-  analysis_model: gemini-2.5-pro
+  triage_model: gemini-3.5-flash-lite
+  analysis_model: gemini-3.6-flash
   monthly_cap_usd: 5.0
   max_retries: 2
   timeout_seconds: 60.0
   max_output_tokens: 4096
   pricing:
-    gemini-2.5-flash:
-      input_per_million: 0.0
-      output_per_million: 0.0
-    gemini-2.5-pro:
-      input_per_million: 0.0
-      output_per_million: 0.0
+    gemini-3.5-flash-lite:
+      input_per_million: 0.30
+      output_per_million: 2.50
+    gemini-3.6-flash:
+      input_per_million: 0.75
+      output_per_million: 3.75
 
 # Emergency stop (SPEC section 9). Set to true to halt all model calls and
 # sandbox execution. FORGEFLOW_KILL_SWITCH=1 in the environment does the same
