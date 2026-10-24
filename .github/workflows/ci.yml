@@ -35,3 +35,13 @@ jobs:
 
       - name: Run the test suite
         run: uv run python -m pytest -q
+
+      # The website's render tests need the optional `web` extra. They are
+      # skipped in the step above (the core install has no Streamlit); this step
+      # installs the extra and runs them for real. The extra is pinned in
+      # uv.lock, so `--frozen` still holds.
+      - name: Install the website extra
+        run: uv sync --frozen --extra web
+
+      - name: Run the test suite with the website extra
+        run: uv run --extra web python -m pytest -q

@@ -100,6 +100,8 @@ class GitHubReader(Protocol):
 
     def get_issue_timeline(self, full_name: str, number: int) -> list[dict[str, Any]]: ...
 
+    def get_issue(self, full_name: str, number: int) -> dict[str, Any]: ...
+
 
 class GitHubClient:
     """A thin, read-only wrapper over the GitHub REST API.
@@ -399,10 +401,19 @@ class GitHubClient:
         entries: list[dict[str, str]] = []
         for entry in payload:
             if isinstance(entry, dict) and "name" in entry:
-                entries.append(
-                    {"name": str(entry["name"]), "type": str(entry.get("type", "file"))}
-                )
+                entries.append({"name": str(entry["name"]), "type": str(entry.get("type", "file"))})
         return entries
+
+    def get_issue(self, full_name: str, number: int) -> dict[str, Any]:
+        """Fetch a single issue by number. Read-only.
+
+        Used by the website to read an issue's title and body without cloning.
+        Returns the raw payload; the caller maps it with ``discovery.issue_from_api``.
+        """
+        payload = self._get_json(f"{self._base_url}/repos/{full_name}/issues/{number}")
+        if not isinstance(payload, dict):
+            raise GitHubError(f"unexpected issue payload for {full_name}#{number}")
+        return payload
 
     def get_issue_timeline(self, full_name: str, number: int) -> list[dict[str, Any]]:
         """Fetch an issue's timeline, used to detect linked pull requests."""

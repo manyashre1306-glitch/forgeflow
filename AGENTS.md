@@ -232,3 +232,44 @@ directory, and `remove_workspace` on a read-only workspace.
 Note: the four Windows failures cannot be reproduced on Linux, so the fix is
 verified by the POSIX behavior staying identical plus tests that exercise the
 handler directly.
+
+## Phase 6: ForgeFlow website (2026-10-24)
+
+Branch `feat/website`. A Streamlit website under `web/` that presents the existing
+pipeline in a browser. It is a **thin presentation layer**: no discovery, ranking,
+analysis, or publishing logic lives in `web/`; every page calls the same functions
+the CLI calls. `web/service.py` holds the pure functions (no Streamlit import);
+`web/views/*.py` only draw.
+
+Environment facts confirmed this phase:
+
+- **No `GEMINI_API_KEY` and no `JULES_API_KEY`.** Both providers fail closed. No
+  paid model call was made to build or test the website.
+- **No container runtime.** The sandbox page reports `IsolationKind.NONE` and
+  refuses; there is still no host-execution fallback.
+- **No external write.** The website never publishes. Its publish page is
+  local-mode only and calls the existing approval/publish functions.
+
+Facts future work must not undo:
+
+- **Hosted is the default mode.** `FORGEFLOW_WEB_MODE` unset or misspelled
+  resolves to `hosted`, the stricter mode (`web/modes.py`). Do not flip this.
+- **The mode is a gate in code, not a label.** `web/local.py` calls
+  `require_local` first in every capability function, so a page that forgot to
+  check cannot reach a hosted-forbidden action. `tests/test_web_isolation.py`
+  fails if this breaks: it walks the web sources with `ast`, calls the guards
+  directly, and puts tripwires on `sqlite3.connect` and `read_publish_token`.
+- **Streamlit is imported lazily, inside functions.** `web/ui.py` is the only
+  module that imports it. `web/app.py` guards `main()` behind `__name__ ==
+  "__main__"`. This keeps the core install and CI working without the extra.
+- **The hosted context builder does not clone.** `web/context.py` reads the tree
+  and files through the read-only contents API under depth/entry/call caps.
+- **`web/limits.py` byte caps are exact.** `cap_text` truncates on a byte
+  boundary and drops a split multi-byte character, so the result always
+  re-encodes to at most the limit. `validate_full_name` refuses `..` and names
+  that do not start alphanumeric.
+
+Gates: core install 1055 passed / 4 skipped (the Streamlit render tests skip
+without the extra); with `uv sync --frozen --extra web`, 1059 passed. ruff check
+and format clean. CI gained a step that installs the extra and re-runs the suite,
+so the render tests run for real.

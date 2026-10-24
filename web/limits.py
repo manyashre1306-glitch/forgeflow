@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 # to 100, both from [A-Za-z0-9-._]. Kept as explicit patterns so a value like
 # "owner/../etc" or "owner repo" is rejected before any request is built.
 _OWNER_RE = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
-_REPO_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}$")
+_REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 
 MAX_OWNER_LENGTH = 39
 MAX_REPO_LENGTH = 100
@@ -59,6 +59,10 @@ def validate_full_name(value: str) -> str:
         raise InputError("the owner part contains characters GitHub does not allow")
     if not _REPO_RE.match(name):
         raise InputError("the repository name contains characters GitHub does not allow")
+    # A name of "." or "..", or containing "..", is invalid on GitHub and could
+    # be used to build a request path that escapes the intended repository.
+    if name in {".", ".."} or ".." in name:
+        raise InputError("the repository name is not valid")
     return f"{owner}/{name}"
 
 
@@ -77,14 +81,15 @@ def cap_text(value: str, *, limit: int = MAX_PASTED_TEXT_BYTES) -> tuple[str, bo
     """Truncate ``value`` to ``limit`` bytes, reporting whether it was cut.
 
     Byte-counted, not character-counted, so a multi-byte payload cannot exceed
-    the cap. Truncation is on a byte boundary and the result is decoded
-    leniently, so a split multi-byte character becomes a replacement rather than
-    an exception.
+    the cap. Truncation is on a byte boundary and a split multi-byte character is
+    dropped, so the returned string always re-encodes to at most ``limit`` bytes.
+    (Decoding a partial character as a replacement would add bytes and break the
+    cap, so it is dropped instead.)
     """
     raw = value.encode("utf-8")
     if len(raw) <= limit:
         return value, False
-    return raw[:limit].decode("utf-8", errors="replace"), True
+    return raw[:limit].decode("utf-8", errors="ignore"), True
 
 
 @dataclass

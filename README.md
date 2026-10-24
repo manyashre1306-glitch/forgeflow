@@ -38,6 +38,7 @@ command you can re-run.
 | 3 | Validation, task states, security checks, approval-boundary tests | Complete |
 | 4 | Controlled publishing (draft PRs), feedback tracking, discovery-only scheduling | Complete, with a documented limitation |
 | 5 | Documentation, architecture, threat model, evaluation, demo, portfolio README | Complete, with documented limitations |
+| 6 | Streamlit website (thin layer over the CLI's functions), with hosted/local modes | Complete; render tests need the optional `web` extra |
 
 Phase 5 adds documentation, the architecture diagram, the threat model, the
 evaluation harness and results, an offline dry-run demo, read-only CI, this
@@ -190,6 +191,43 @@ uv run forgeflow publish pydantic/pydantic#1234 --confirm-real-publish
 
 Run `uv run forgeflow --help` for the full command list.
 
+## Website
+
+ForgeFlow ships a Streamlit website that presents the same pipeline in a browser.
+It is a thin presentation layer: every page calls the same functions the CLI
+calls, and it holds no logic of its own.
+
+```bash
+uv sync --extra web
+uv run --extra web streamlit run web/app.py     # or: make web
+```
+
+The website has two run modes, selected by `FORGEFLOW_WEB_MODE`. **Hosted is the
+default when the variable is unset**, because the safe assumption for a public
+deployment is that it is public.
+
+| Capability | `hosted` (default) | `local` |
+| --- | --- | --- |
+| Read the local database | refused | allowed |
+| Execute repository code | refused | allowed, if a runtime exists |
+| Import the publisher / read the publish token | refused | allowed, through the existing guards |
+| Use the visitor's own key and token | yes, in the session only | yes |
+
+The mode is a hard gate in code, not a label. `web/local.py` calls
+`require_local` first in every capability function, so a page that forgot to check
+still cannot reach a hosted-forbidden action. `tests/test_web_isolation.py`
+proves it: it walks the web sources with `ast` to show no hosted-reachable module
+imports the publisher or the token, runs the capability functions directly to show
+they refuse, and puts tripwires on `sqlite3.connect` and `read_publish_token` to
+show the refusal happens before either is touched.
+
+The hosted context builder does not clone a repository. It reads the tree and the
+relevant files through the read-only contents API under strict caps, so one page
+load cannot become thousands of requests. See `web/context.py`.
+
+Full run and deployment guide, including what a public deployment still needs
+(TLS, a process manager, resource limits): [`docs/deploy-website.md`](docs/deploy-website.md).
+
 ## Test command
 
 ```bash
@@ -200,6 +238,13 @@ The suite is entirely offline: the GitHub client is injected, the LLM backend is
 replaced by a scripted fake, the coding agent by `MockAgent`, and repository
 clones come from a local fixture. It needs no `GITHUB_TOKEN`, no `GEMINI_API_KEY`,
 and no container runtime.
+
+The website's render tests need the optional `web` extra. They are skipped in the
+command above and run for real with:
+
+```bash
+uv run --extra web python -m pytest -q     # or: make test-web
+```
 
 ## Make targets
 
@@ -215,6 +260,8 @@ make rank       # uv run forgeflow rank
 make report     # uv run forgeflow report
 make eval       # the offline evaluation harness (SPEC section 11)
 make demo       # the offline dry-run end-to-end demonstration
+make web        # run the website locally (needs `uv sync --extra web`)
+make test-web   # the test suite including the Streamlit render tests
 make clean      # remove caches and the local database
 ```
 
@@ -228,6 +275,9 @@ make clean      # remove caches and the local database
 | [`docs/cost-controls.md`](docs/cost-controls.md) | budgets, caps, and how to verify current vendor pricing |
 | [`docs/setup.md`](docs/setup.md) | the full local walkthrough |
 | [`docs/demonstration.md`](docs/demonstration.md) | the offline dry-run demo and what it does not claim |
+| [`docs/deploy-website.md`](docs/deploy-website.md) | running and deploying the website, and its two modes |
+| [`CONTRIBUTING.md`](CONTRIBUTING.md) | how to set up, the three gates, and the rules the code must keep |
+| [`docs/contributing-ideas.md`](docs/contributing-ideas.md) | a menu of concrete, bounded contribution tasks |
 | [`docs/spec-audit.md`](docs/spec-audit.md) | a requirement-by-requirement audit of SPEC sections 1–16, with evidence |
 
 ## Evaluation
@@ -360,9 +410,21 @@ src/forgeflow/
   security.py            secret scrubbing for recorded output
 evaluation/              SPEC section 11 metrics harness (offline fixtures)
 demo/                    offline dry-run end-to-end demonstration (no writes)
+web/                     Streamlit website (thin layer over the same functions)
+  app.py                 entry point and sidebar navigation
+  modes.py               hosted/local resolution and the capability guards
+  service.py             pure functions: find/rank, rules, analysis (no Streamlit)
+  context.py             hosted context via the read-only contents API (no clone)
+  analysis.py            session-capped model backend (visitor's own key)
+  patch_agent.py         patch generator behind the CodingAgent protocol
+  local.py               local-only capabilities; every function guards first
+  limits.py              input validation and per-session caps
+  session.py             session state and secret clearing
+  ui.py                  the only module that imports Streamlit (lazily)
+  views/                 one render function per page
 config/repositories.yaml   allowlist, weights, skill keywords, LLM settings
 docs/                      SPEC, architecture, threat model, evaluation,
-                           cost controls, setup, demonstration
+                           cost controls, setup, demonstration, deployment
 ```
 
 ## License

@@ -74,7 +74,7 @@ def secret_input(label: str, *, key: str, help_text: str = "") -> str:
     return st.text_input(label, type="password", key=key, help=help_text or None)
 
 
-def show_error(message: str, *, detail: str | None = None) -> None:
+def show_error(message: str, detail: str | None = None) -> None:
     st = _st()
     st.error(message)
     if detail:
