@@ -51,11 +51,45 @@ LEGAL_TRANSITIONS: dict[TaskState, frozenset[TaskState]] = {
         {TaskState.VALIDATING, TaskState.FAILED_VALIDATION, TaskState.DISCARDED}
     ),
     TaskState.VALIDATING: frozenset(
-        {TaskState.AWAITING_PUBLISH_APPROVAL, TaskState.FAILED_VALIDATION}
+        {
+            TaskState.AWAITING_PUBLISH_APPROVAL,
+            TaskState.FAILED_VALIDATION,
+            # A reviewer can send a patch back for another attempt, or abandon
+            # the task, without it having passed validation first.
+            TaskState.IMPLEMENTING,
+            TaskState.DISCARDED,
+        }
     ),
-    TaskState.FAILED_VALIDATION: frozenset({TaskState.IMPLEMENTING, TaskState.DISCARDED}),
-    TaskState.AWAITING_PUBLISH_APPROVAL: frozenset({TaskState.PUBLISHED, TaskState.DISCARDED}),
-    TaskState.PUBLISHED: frozenset({TaskState.MERGED, TaskState.CLOSED}),
+    TaskState.FAILED_VALIDATION: frozenset(
+        {
+            TaskState.IMPLEMENTING,
+            TaskState.DISCARDED,
+            # Reachable only when the approval gate finds a recorded exception: a
+            # failed check is overridable by explicit review (SPEC 7), and without
+            # this edge a documented exception could be recorded but never used.
+            TaskState.AWAITING_PUBLISH_APPROVAL,
+        }
+    ),
+    TaskState.AWAITING_PUBLISH_APPROVAL: frozenset(
+        {
+            TaskState.PUBLISHED,
+            TaskState.DISCARDED,
+            # A reviewer can withdraw approval and ask for changes instead.
+            TaskState.IMPLEMENTING,
+        }
+    ),
+    TaskState.PUBLISHED: frozenset(
+        {
+            TaskState.MERGED,
+            TaskState.CLOSED,
+            # A maintainer can request changes on an open PR, which sends the
+            # task back to implementation. SPEC 11 measures the substantive
+            # revision rate, so this path must exist; without it a review
+            # requesting changes has nowhere to go. Re-publishing still needs
+            # fresh validation and a fresh approval, so this adds no write risk.
+            TaskState.IMPLEMENTING,
+        }
+    ),
     TaskState.MERGED: frozenset(),
     TaskState.CLOSED: frozenset(),
     TaskState.DISCARDED: frozenset(),
@@ -216,6 +250,11 @@ class RankedIssue(BaseModel):
     issue: Issue
     score: IssueScore
     rank: int = Field(ge=1)
+    # A small, capped correction from tracked PR outcomes for this repository
+    # (SPEC section 11: "to improve future issue ranking"). Points on the same
+    # 0-100 scale as the weighted total. Zero when no outcomes were supplied, so
+    # a ranking with no history is unchanged. Bounded by the configured cap.
+    outcome_adjustment: float = 0.0
 
     @model_validator(mode="after")
     def _check_score_matches_issue(self) -> RankedIssue:
@@ -409,6 +448,48 @@ def compute_cost_usd(
     return round(cost, 6)
 
 
+class PublishMode(StrEnum):
+    """Whether a publish run may write to GitHub (SPEC section 8).
+
+    Dry-run is the default everywhere. A real write needs an explicit flag, a
+    valid approval, and a repository on the allowlist.
+    """
+
+    DRY_RUN = "dry_run"
+    REAL = "real"
+
+
+class PublicationRecord(BaseModel):
+    """One publish attempt and its outcome (SPEC sections 8 and 10).
+
+    Recorded for dry runs too, so the log shows what would have been written.
+    ``pr_number`` is None until a real PR is created, and is never invented.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: int | None = None
+    created_at: datetime | None = None
+    repo_full_name: str
+    issue_number: int
+    # Empty only when a publish was refused before the patch was examined, such
+    # as a third-party repository. A real publication always carries the full
+    # hash, and the idempotence query ignores empty-hash rows.
+    patch_sha256: str = Field(default="", max_length=64)
+    target_branch: str = ""
+    head_branch: str = ""
+    mode: PublishMode = PublishMode.DRY_RUN
+    published: bool = False
+    draft: bool = True
+    pr_number: int | None = None
+    pr_url: str = ""
+    title: str = ""
+    body: str = ""
+    # Set when a real publish was refused, so the reason is on record.
+    refusal_reason: str = ""
+    actor: str = "operator"
+
+
 class PatchRecord(BaseModel):
     """A captured patch and its content hash (SPEC sections 2H and 2I).
 
@@ -451,3 +532,346 @@ class AnalysisRecord(BaseModel):
     model: str
     confidence: float = Field(default=0.0, ge=0.0, le=1.0)
     payload_json: str
+
+
+class CheckKind(StrEnum):
+    """The kinds of quality check SPEC section 7 requires."""
+
+    TESTS = "tests"
+    LINT = "lint"
+    FORMAT = "format"
+    TYPES = "types"
+    DIFF = "diff"
+
+
+class CheckStatus(StrEnum):
+    """Outcome of one check. PASSED requires execution evidence."""
+
+    PASSED = "passed"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+    ERRORED = "errored"
+
+
+class ValidationCheck(BaseModel):
+    """One recorded check: command, status, output, and why it was skipped.
+
+    ``command`` is stored as a list so it survives shell quoting and can be
+    re-run verbatim. ``status`` is only ever PASSED when the command actually
+    ran and exited zero; a check that could not run is SKIPPED with a reason,
+    never PASSED.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: CheckKind
+    name: str
+    command: list[str] = Field(default_factory=list)
+    status: CheckStatus
+    exit_code: int | None = None
+    output: str = ""
+    duration_seconds: float = 0.0
+    skip_reason: str | None = None
+    limitation: str | None = None
+    timed_out: bool = False
+
+    @property
+    def passed(self) -> bool:
+        return self.status is CheckStatus.PASSED
+
+    @property
+    def blocking(self) -> bool:
+        """A failed or errored check blocks publishing; a skip does not."""
+        return self.status in {CheckStatus.FAILED, CheckStatus.ERRORED}
+
+
+class DiffFinding(BaseModel):
+    """One suspicious thing found while inspecting a diff."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    category: str
+    severity: str = "warning"
+    path: str = ""
+    detail: str
+    evidence: str = ""
+
+
+class ValidationReport(BaseModel):
+    """The full result of validating one patch (SPEC section 7)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    repo_full_name: str
+    issue_number: int
+    patch_sha256: str
+    isolated: bool
+    checks: list[ValidationCheck] = Field(default_factory=list)
+    findings: list[DiffFinding] = Field(default_factory=list)
+    repair_attempts: int = 0
+    environment_limitations: list[str] = Field(default_factory=list)
+    exception_authorized_by: str | None = None
+    exception_reason: str | None = None
+    created_at: datetime | None = None
+
+    @property
+    def blocking_failures(self) -> list[ValidationCheck]:
+        return [check for check in self.checks if check.blocking]
+
+    @property
+    def skipped(self) -> list[ValidationCheck]:
+        return [check for check in self.checks if check.status is CheckStatus.SKIPPED]
+
+    @property
+    def applicable(self) -> list[ValidationCheck]:
+        """Checks that had a command to run.
+
+        A check with no command means the repository does not use that tool, so
+        it is not evidence either way. A check that was skipped *despite* having
+        a command (no isolation, or a refused destructive command) is a real
+        gap and stays in this list.
+        """
+        return [check for check in self.checks if check.command]
+
+    @property
+    def passed(self) -> bool:
+        """True only when every applicable check ran and exited zero.
+
+        A pass requires execution evidence: at least one applicable check, all
+        of them PASSED, and no blocking diff finding. An all-skipped report is
+        never a pass, which is what stops "no isolation" from being read as
+        success.
+        """
+        applicable = self.applicable
+        if not applicable:
+            return False
+        if any(check.status is not CheckStatus.PASSED for check in applicable):
+            return False
+        return not any(finding.severity == "blocking" for finding in self.findings)
+
+    @property
+    def may_publish(self) -> bool:
+        """Whether this report permits publishing.
+
+        A documented exception is the only way past a failure (SPEC section 7).
+        Without one, publishing requires the same evidence a pass requires, so a
+        report with no executed checks can never authorize a publish.
+        """
+        if self.exception_authorized_by:
+            return True
+        return self.passed
+
+
+class AuditEvent(BaseModel):
+    """One append-only audit record (SPEC section 9).
+
+    ``detail`` and ``payload_json`` are already redacted when this object is
+    built, so nothing downstream can reintroduce a secret by printing it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: int | None = None
+    created_at: datetime | None = None
+    event: str
+    repo_full_name: str | None = None
+    issue_number: int | None = None
+    actor: str = "forgeflow"
+    severity: str = "info"
+    detail: str = ""
+    payload_json: str = "{}"
+
+
+class KillSwitchState(BaseModel):
+    """The persistent kill-switch flag, stored in SQLite (SPEC section 9).
+
+    Three sources can engage the switch: this database flag, the configuration
+    file, and the environment. Any one of them is sufficient, so an operator can
+    stop the system through whichever channel is reachable at the time.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    engaged: bool = False
+    reason: str = ""
+    changed_by: str = ""
+    changed_at: datetime | None = None
+
+
+class ApprovalAction(StrEnum):
+    """The four approval-boundary actions (SPEC section 8)."""
+
+    APPROVE = "approve"
+    REQUEST_CHANGES = "request_changes"
+    REJECT = "reject"
+    DISCARD = "discard"
+
+
+class ApprovalRecord(BaseModel):
+    """A human decision bound to one exact patch (SPEC sections 8 and 10).
+
+    The binding is the point. An approval records the patch hash, the target
+    repository, and the target branch it was given for, so a later change to any
+    of them invalidates it. ``is_valid_for`` performs that check.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: int | None = None
+    created_at: datetime | None = None
+    repo_full_name: str
+    issue_number: int
+    action: ApprovalAction
+    patch_sha256: str = Field(min_length=64, max_length=64)
+    target_branch: str = ""
+    actor: str = "operator"
+    reason: str = ""
+    # True once a later patch or a newer decision supersedes this one.
+    superseded: bool = False
+
+    def is_valid_for(
+        self,
+        *,
+        patch_sha256: str,
+        repo_full_name: str,
+        target_branch: str,
+    ) -> tuple[bool, str]:
+        """Whether this approval still authorizes publishing the given patch.
+
+        Every mismatch returns a specific reason, so the operator learns which
+        of the four bindings changed rather than a generic refusal.
+        """
+        if self.superseded:
+            return False, "this approval was superseded by a newer decision"
+        if self.action is not ApprovalAction.APPROVE:
+            return False, f"the latest decision was '{self.action.value}', not 'approve'"
+        if self.repo_full_name != repo_full_name:
+            return False, (f"approval was for {self.repo_full_name}, not {repo_full_name}")
+        if self.patch_sha256 != patch_sha256:
+            return False, (
+                "the patch changed since approval "
+                f"(approved {self.patch_sha256[:12]}, now {patch_sha256[:12]})"
+            )
+        if self.target_branch != target_branch:
+            return False, (f"approval was for branch {self.target_branch!r}, not {target_branch!r}")
+        return True, ""
+
+
+# --------------------------------------------------------------------------
+# Phase 4: pull-request outcomes and evaluation (SPEC sections 11 and 15)
+# --------------------------------------------------------------------------
+
+
+class PullRequestStatus(StrEnum):
+    """The three states a pull request can be in.
+
+    ``MERGED`` and ``CLOSED`` are distinct: a PR that was closed without being
+    merged is a different outcome from one a maintainer merged, and SPEC section
+    15 requires the difference to be reported accurately.
+    """
+
+    OPEN = "open"
+    MERGED = "merged"
+    CLOSED = "closed"
+
+
+class ReviewDecision(StrEnum):
+    """The latest review decision on a pull request.
+
+    ``NONE`` means no review has been submitted yet, which is not the same as a
+    review that approved or requested changes.
+    """
+
+    APPROVED = "approved"
+    CHANGES_REQUESTED = "changes_requested"
+    COMMENTED = "commented"
+    DISMISSED = "dismissed"
+    REVIEW_REQUIRED = "review_required"
+    NONE = "none"
+
+
+class PullRequestOutcome(BaseModel):
+    """The real, fetched state of one pull request (SPEC sections 11 and 15).
+
+    Every field comes from the GitHub API or from ForgeFlow's own records. None
+    of them is guessed: an unknown review decision is ``NONE``, and ``pr_url`` is
+    left empty rather than constructed, so a link is only ever shown when GitHub
+    returned it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: int | None = None
+    checked_at: datetime | None = None
+    repo_full_name: str
+    issue_number: int = Field(ge=1)
+    pr_number: int = Field(ge=1)
+    pr_url: str = ""
+    status: PullRequestStatus
+    draft: bool = True
+    merged: bool = False
+    merged_at: datetime | None = None
+    closed_at: datetime | None = None
+    review_decision: ReviewDecision = ReviewDecision.NONE
+    # Number of review submissions plus inline review comments. Named
+    # ``review_comments`` because it counts things a maintainer wrote, not
+    # things ForgeFlow did.
+    review_comments: int = Field(default=0, ge=0)
+    # Reviews whose state was CHANGES_REQUESTED.
+    requested_changes: int = Field(default=0, ge=0)
+    approvals: int = Field(default=0, ge=0)
+    # Failing or errored validation checks recorded for this task's patch.
+    failures: int = Field(default=0, ge=0)
+    # Recorded model spend for this task, in US dollars.
+    cost_usd: float = Field(default=0.0, ge=0.0)
+
+    @field_validator("repo_full_name")
+    @classmethod
+    def _check_full_name(cls, value: str) -> str:
+        return _validate_repo_full_name(value)
+
+
+class ReviewRecord(BaseModel):
+    """One pull-request review submission, as returned by GitHub.
+
+    Stored per review id so re-tracking a PR updates the row instead of
+    appending a duplicate. ``body`` is untrusted maintainer text; it is stored
+    verbatim and never interpreted as an instruction.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: int | None = None
+    repo_full_name: str
+    issue_number: int = Field(ge=1)
+    pr_number: int = Field(ge=1)
+    review_id: int = Field(ge=1)
+    author: str = ""
+    state: str = ""
+    submitted_at: datetime | None = None
+    body: str = ""
+
+
+class OutcomeMetrics(BaseModel):
+    """The SPEC section 11 evaluation fields for one task.
+
+    These are internal measurements, not claims made to a maintainer. Each is a
+    0.0 to 1.0 score, except ``maintainer_feedback`` which holds the maintainer's
+    own words, empty when none were given.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: int | None = None
+    computed_at: datetime | None = None
+    repo_full_name: str
+    issue_number: int = Field(ge=1)
+    patch_usefulness: float = Field(ge=0.0, le=1.0)
+    test_quality: float = Field(ge=0.0, le=1.0)
+    complexity: float = Field(ge=0.0, le=1.0)
+    maintainer_feedback: str = ""
+
+    @field_validator("repo_full_name")
+    @classmethod
+    def _check_full_name(cls, value: str) -> str:
+        return _validate_repo_full_name(value)

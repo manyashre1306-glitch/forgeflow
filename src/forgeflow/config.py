@@ -67,6 +67,57 @@ class LLMConfig(BaseModel):
         return [m for m in (self.triage_model, self.analysis_model) if m not in self.pricing]
 
 
+class OutcomeRankingConfig(BaseModel):
+    """How tracked PR outcomes nudge ranking (SPEC section 11).
+
+    This is deliberately small and capped. The point of SPEC section 11 is to
+    "improve future issue ranking" without "optimizing only for contribution
+    count or merge rate", so the adjustment:
+
+    * is off by default (``enabled: false``), so ranking is unchanged until a
+      human turns it on;
+    * can move an issue by at most ``max_adjustment_points`` on the 0-100 scale,
+      which is far smaller than the weight of any single factor;
+    * rewards maintainer engagement — approvals and merges count, but so does a
+      maintainer who requested changes, because that is also a real signal that
+      the task was worth doing. A PR closed with no engagement does not help.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    # Hard ceiling on the points this adjustment may add or remove. Small by
+    # design: a large value would let history dominate the six spec factors.
+    max_adjustment_points: float = Field(default=3.0, ge=0.0, le=10.0)
+    # Points per merged PR, per approval, and per changes-requested, before the
+    # cap is applied. Merges weigh most, but they are not the only signal.
+    points_per_merge: float = Field(default=1.5, ge=0.0, le=5.0)
+    points_per_approval: float = Field(default=1.0, ge=0.0, le=5.0)
+    points_per_changes_requested: float = Field(default=0.5, ge=0.0, le=5.0)
+    # A repository whose PRs were closed without engagement is a weaker
+    # prospect; this is the per-close penalty, capped with the rest.
+    points_per_closed_unmerged: float = Field(default=-0.5, ge=-5.0, le=0.0)
+    # Only the most recent outcomes count, so ancient history cannot dominate.
+    lookback: int = Field(default=20, ge=1, le=200)
+
+
+class ScheduleConfig(BaseModel):
+    """Optional scheduled discovery (SPEC section 13, Phase 4).
+
+    Off by default. When enabled, the only thing a cycle may do is run
+    discovery. Publishing is never scheduled: SPEC section 8 requires an explicit
+    human approval for every external write, and a timer cannot supply one.
+
+    Enable this only after manual discovery, ranking, analysis, validation, and
+    publishing have all proved reliable by hand. See the README.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    interval_minutes: int = Field(default=360, ge=5, le=10080)
+
+
 class AppConfig(BaseModel):
     """Validated contents of ``config/repositories.yaml``."""
 
@@ -79,6 +130,8 @@ class AppConfig(BaseModel):
     opt_out_labels: list[str] = Field(default_factory=list)
     preferred_labels: list[str] = Field(default_factory=list)
     llm: LLMConfig = Field(default_factory=lambda: LLMConfig())
+    outcome_ranking: OutcomeRankingConfig = Field(default_factory=lambda: OutcomeRankingConfig())
+    schedule: ScheduleConfig = Field(default_factory=lambda: ScheduleConfig())
     kill_switch: bool = False
 
     @field_validator("repositories")
@@ -154,17 +207,32 @@ class KillSwitchEngagedError(RuntimeError):
 def kill_switch_engaged(
     config: AppConfig | None = None,
     settings: Settings | None = None,
+    conn: object | None = None,
 ) -> tuple[bool, str]:
     """Report whether the kill switch is engaged, and why.
 
-    Two independent sources, so either one alone is enough to stop the system:
-    ``kill_switch: true`` in ``config/repositories.yaml``, or
-    ``FORGEFLOW_KILL_SWITCH`` set to a truthy value in the environment. The
-    environment route matters because it can be set on a running deployment
-    without editing a file that might be under review.
+    Three independent sources, so any one alone is enough to stop the system:
+
+    * ``kill_switch: true`` in ``config/repositories.yaml``
+    * ``FORGEFLOW_KILL_SWITCH`` set in the environment
+    * the ``kill_switch`` row in SQLite, set by ``forgeflow kill-switch on``
+
+    The database route exists because it can be flipped while the system is
+    running and without touching a file that might be under review. The
+    environment route works when the database is unreachable. Any engaged source
+    stops the run; the first one found is reported.
     """
     if config is not None and config.kill_switch:
         return True, "kill_switch is enabled in the configuration file"
+
+    if conn is not None:
+        from forgeflow import killswitch
+
+        state = killswitch.read_state(conn)  # type: ignore[arg-type]
+        if state.engaged:
+            who = f" by {state.changed_by}" if state.changed_by else ""
+            why = f": {state.reason}" if state.reason else ""
+            return True, f"kill switch engaged in the database{who}{why}"
 
     resolved = settings if settings is not None else Settings()
     if resolved.kill_switch:
@@ -176,15 +244,29 @@ def kill_switch_engaged(
 def require_kill_switch_clear(
     config: AppConfig | None = None,
     settings: Settings | None = None,
+    conn: object | None = None,
 ) -> None:
     """Raise if the kill switch is engaged. No-op otherwise."""
-    engaged, reason = kill_switch_engaged(config, settings)
+    engaged, reason = kill_switch_engaged(config, settings, conn)
     if engaged:
         raise KillSwitchEngagedError(
-            f"kill switch engaged ({reason}); refusing to continue. Unset "
-            f"{KILL_SWITCH_ENV} or set kill_switch: false in the configuration "
-            f"file to resume."
+            f"kill switch engaged ({reason}); refusing to continue. {_remedy_for(reason)}"
         )
+
+
+def _remedy_for(reason: str) -> str:
+    """Name the one action that clears the source that is actually engaged.
+
+    A generic remedy is worse than none: telling an operator to unset an
+    environment variable that is not set sends them down the wrong path.
+    """
+    if "configuration file" in reason:
+        return "Set kill_switch: false in the configuration file to resume."
+    if "database" in reason:
+        return "Run 'forgeflow kill-switch off' to resume."
+    if KILL_SWITCH_ENV in reason:
+        return f"Unset {KILL_SWITCH_ENV} to resume."
+    return "Clear the engaged kill-switch source to resume."
 
 
 def load_config(path: str | Path) -> AppConfig:

@@ -18,9 +18,10 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from forgeflow import approval, audit, killswitch, outcome_tracker, scheduler
 from forgeflow import report as report_module
-from forgeflow import storage
 from forgeflow.agent_runner import AgentUnavailableError, get_agent
+from forgeflow.approval import ApprovalError, storage
 from forgeflow.config import (
     AppConfig,
     ConfigError,
@@ -31,6 +32,7 @@ from forgeflow.config import (
 )
 from forgeflow.dedupe import DroppedIssue, deduplicate, filter_issues
 from forgeflow.discovery import DiscoveryResult, collect_linked_open_prs, discover_issues
+from forgeflow.errors import ForgeFlowError
 from forgeflow.github_client import GitHubClient, GitHubError, GitHubReader, MissingTokenError
 from forgeflow.issue_analyzer import (
     AnalyzerError,
@@ -38,9 +40,28 @@ from forgeflow.issue_analyzer import (
     ModelUnavailableError,
     build_analyzer,
 )
-from forgeflow.models import Issue, TaskState
-from forgeflow.pipeline import PipelineError, run_analysis, run_context, run_implement, run_review
-from forgeflow.ranking import rank_issues, resolve_weights, total_for
+from forgeflow.models import (
+    ApprovalAction,
+    IllegalTransitionError,
+    Issue,
+    PublishMode,
+    TaskState,
+)
+from forgeflow.pipeline import (
+    PipelineError,
+    run_analysis,
+    run_context,
+    run_implement,
+    run_review,
+    run_validation,
+)
+from forgeflow.publisher import (
+    GitHubWriteClient,
+    PublisherError,
+    plan_publish,
+)
+from forgeflow.publisher import publish as publish_patch
+from forgeflow.ranking import adjusted_total, rank_issues, resolve_weights
 from forgeflow.repository_context import (
     RepositoryContextError,
     list_workspaces,
@@ -49,6 +70,7 @@ from forgeflow.repository_context import (
     workspace_size_bytes,
 )
 from forgeflow.sandbox import IsolationError, build_sandbox
+from forgeflow.validation import build_validator
 
 DEFAULT_CONFIG_PATH = Path("config/repositories.yaml")
 DEFAULT_DB_PATH = Path("data/forgeflow.db")
@@ -60,10 +82,6 @@ app = typer.Typer(
     add_completion=False,
 )
 console = Console()
-
-
-class ForgeFlowError(RuntimeError):
-    """A user-facing failure. The CLI prints the message and exits non-zero."""
 
 
 # --- shared helpers ---------------------------------------------------------
@@ -184,17 +202,33 @@ def run_discover(
 
 
 def run_rank(db_path: Path, config: AppConfig | None = None) -> list:
-    """Rank stored issues, persist the scores, and return the ranked list."""
+    """Rank stored issues, persist the scores, and return the ranked list.
+
+    Tracked PR outcomes are supplied when the adjustment is enabled in config,
+    so a repository with real, engaged-with history gets a small, capped nudge.
+    """
     conn = open_db(db_path)
     try:
         issues = storage.list_issues(conn)
         repositories = {repo.full_name: repo for repo in storage.list_repositories(conn)}
-        ranked = rank_issues(issues, config, repositories)
+        outcomes = _outcome_stats_for_ranking(conn, config)
+        ranked = rank_issues(issues, config, repositories, outcomes=outcomes)
         for entry in ranked:
             storage.upsert_issue_score(conn, entry.score)
         return ranked
     finally:
         conn.close()
+
+
+def _outcome_stats_for_ranking(conn, config: AppConfig | None):
+    """Outcome stats for ranking, or None when the adjustment is disabled.
+
+    Returning None when disabled keeps the ranking path free of an outcome
+    lookup in the common case, and makes "off" mean exactly "unchanged".
+    """
+    if config is None or not config.outcome_ranking.enabled:
+        return None
+    return outcome_tracker.outcome_stats_by_repo(conn, lookback=config.outcome_ranking.lookback)
 
 
 def run_report(
@@ -208,7 +242,8 @@ def run_report(
     try:
         issues = storage.list_issues(conn)
         repositories = {repo.full_name: repo for repo in storage.list_repositories(conn)}
-        ranked = rank_issues(issues, config, repositories)
+        outcomes = _outcome_stats_for_ranking(conn, config)
+        ranked = rank_issues(issues, config, repositories, outcomes=outcomes)
         for entry in ranked:
             storage.upsert_issue_score(conn, entry.score)
         weights = resolve_weights(config)
@@ -321,6 +356,78 @@ def discover(
 
 
 @app.command()
+def schedule(
+    config_path: Annotated[Path, typer.Option("--config", "-c")] = DEFAULT_CONFIG_PATH,
+    db_path: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
+    limit: Annotated[
+        int, typer.Option("--limit", "-n", help="Maximum issues to fetch per repository.")
+    ] = 100,
+    run: Annotated[
+        bool, typer.Option("--run", help="Run one discovery cycle now if it is due.")
+    ] = False,
+) -> None:
+    """Show or run the optional scheduled DISCOVERY cycle (SPEC section 13).
+
+    Discovery only. Publishing is never scheduled: every external write needs
+    explicit human approval (SPEC section 8). Off by default; enable it in the
+    config only after manual runs are reliable. This command does not daemonise
+    or loop; with --run it performs at most one cycle and exits.
+    """
+    try:
+        config = load_app_config(config_path)
+    except ForgeFlowError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    console.print(scheduler.describe_schedule(config.schedule))
+    if not run:
+        console.print(
+            "[dim]Pass --run to perform one discovery cycle if it is due. "
+            "Nothing runs on a timer by itself.[/dim]"
+        )
+        return
+
+    conn = open_db(db_path)
+    try:
+
+        def _discover() -> str:
+            with build_client() as client:
+                result = run_discover(
+                    client,
+                    config,
+                    db_path,
+                    per_repo_limit=limit,
+                    detect_tests=True,
+                    fetch_linked_prs=True,
+                )
+            return f"discovered {len(result.issues)} issue(s)"
+
+        def _kill_switch_engaged() -> bool:
+            return config.kill_switch or killswitch.read_state(conn).engaged
+
+        try:
+            outcome = scheduler.run_due(
+                conn,
+                config.schedule,
+                discover=_discover,
+                kill_switch_engaged=_kill_switch_engaged,
+            )
+        except (scheduler.ScheduleError, ForgeFlowError) as exc:
+            console.print(f"[red]error:[/red] {exc}")
+            raise typer.Exit(code=1) from exc
+        except GitHubError as exc:
+            console.print(f"[red]GitHub error:[/red] {exc}")
+            raise typer.Exit(code=1) from exc
+    finally:
+        conn.close()
+
+    if outcome.ran:
+        console.print(f"ran scheduled {outcome.command}: {outcome.detail}")
+    else:
+        console.print(f"did not run: {outcome.reason}")
+
+
+@app.command()
 def rank(
     config_path: Annotated[Path, typer.Option("--config", "-c")] = DEFAULT_CONFIG_PATH,
     db_path: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
@@ -344,16 +451,22 @@ def rank(
     table.add_column("#", justify="right")
     table.add_column("Issue")
     table.add_column("Total", justify="right")
+    table.add_column("Outcome", justify="right")
     table.add_column("Title", overflow="fold")
     for entry in ranked[:top]:
         table.add_row(
             str(entry.rank),
             f"{entry.issue.repo_full_name}#{entry.issue.number}",
-            f"{total_for(entry.score, weights):.2f}",
+            f"{adjusted_total(entry.score, weights, entry.outcome_adjustment):.2f}",
+            f"{entry.outcome_adjustment:+.2f}" if entry.outcome_adjustment else "-",
             entry.issue.title,
         )
     console.print(table)
     console.print("[dim]Scores are initial heuristics, not predictors of PR acceptance.[/dim]")
+    console.print(
+        "[dim]Outcome column is a small, capped history nudge, off by default "
+        "(config outcome_ranking.enabled).[/dim]"
+    )
 
 
 @app.command()
@@ -468,8 +581,11 @@ def analyze(
     repo_full_name, number = parse_issue_reference(issue)
     try:
         config = load_app_config(config_path)
-        require_kill_switch_clear(config)
         conn = open_db(db_path)
+        # Check all three sources: the config file, the environment, and the
+        # database flag. Checking only the config would let a database stop be
+        # bypassed by this command.
+        require_kill_switch_clear(config, None, conn)
     except KillSwitchEngagedError as exc:
         console.print(f"[red]kill switch:[/red] {exc}")
         raise typer.Exit(code=1) from exc
@@ -519,6 +635,7 @@ def analyze(
 def implement(
     issue: Annotated[str, typer.Argument(help="Issue reference, e.g. pydantic/pydantic#1234.")],
     db_path: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
+    config_path: Annotated[Path, typer.Option("--config")] = DEFAULT_CONFIG_PATH,
     workspace_root: Annotated[Path, typer.Option("--workspace-root")] = Path("data/workspaces"),
     provider: Annotated[
         str, typer.Option("--provider", help="Coding agent provider: mock or jules.")
@@ -542,18 +659,17 @@ def implement(
         raise typer.Exit(code=1)
 
     try:
+        config = load_app_config(config_path)
         conn = open_db(db_path)
+        require_kill_switch_clear(config, None, conn)
+    except KillSwitchEngagedError as exc:
+        console.print(f"[red]kill switch:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
     except ForgeFlowError as exc:
         console.print(f"[red]error:[/red] {exc}")
         raise typer.Exit(code=1) from exc
 
-    try:
-        require_kill_switch_clear()
-    except KillSwitchEngagedError as exc:
-        console.print(f"[red]kill switch:[/red] {exc}")
-        raise typer.Exit(code=1) from exc
-
-    sandbox = build_sandbox()
+    sandbox = build_sandbox(app_config=config)
     if not sandbox.is_isolated:
         console.print("[yellow]warning:[/yellow] no container isolation available.")
         console.print(
@@ -690,6 +806,606 @@ def workspace(
 
     console.print(f"[red]error:[/red] unknown action {action!r}; use list, prune, or remove")
     raise typer.Exit(code=1)
+
+
+@app.command("kill-switch")
+def kill_switch(
+    action: Annotated[str, typer.Argument(help="One of: status, on, off.")] = "status",
+    db_path: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
+    reason: Annotated[str, typer.Option("--reason", help="Why the switch was flipped.")] = "",
+    actor: Annotated[str, typer.Option("--actor", help="Who flipped it.")] = "operator",
+) -> None:
+    """Engage, disengage, or inspect the persistent kill switch.
+
+    Engaging stops all model calls and sandbox execution. This is the database
+    flag; the configuration file and FORGEFLOW_KILL_SWITCH do the same thing.
+    Any one of the three is enough to stop a run.
+    """
+    if action not in {"status", "on", "off"}:
+        console.print(f"[red]error:[/red] unknown action {action!r}; use status, on, or off")
+        raise typer.Exit(code=1)
+
+    conn = open_db(db_path)
+    try:
+        if action == "status":
+            state = killswitch.read_state(conn)
+            table = Table(title="kill switch")
+            table.add_column("field")
+            table.add_column("value")
+            table.add_row("engaged", "yes" if state.engaged else "no")
+            table.add_row("reason", state.reason or "-")
+            table.add_row("changed by", state.changed_by or "-")
+            table.add_row("changed at", state.changed_at.isoformat() if state.changed_at else "-")
+            console.print(table)
+
+            # Report the other two sources too, so the operator sees the whole
+            # picture rather than only the database flag.
+            from forgeflow.config import kill_switch_engaged
+
+            engaged, why = kill_switch_engaged(None, None, conn)
+            console.print(
+                f"effective: {'ENGAGED' if engaged else 'clear'} ({why or 'no source engaged'})"
+            )
+            return
+
+        engaged = action == "on"
+        state = killswitch.set_state(conn, engaged, reason=reason, actor=actor)
+        audit.record(
+            conn,
+            "kill_switch.engaged" if engaged else "kill_switch.disengaged",
+            actor=actor,
+            severity="critical" if engaged else "info",
+            detail=reason or f"kill switch turned {action}",
+        )
+        console.print(f"kill switch {'ENGAGED' if state.engaged else 'DISENGAGED'}")
+        if state.engaged:
+            console.print("All model calls and sandbox execution will now be refused.")
+    finally:
+        conn.close()
+
+
+@app.command()
+def audit_log(
+    db_path: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
+    issue: Annotated[
+        str | None, typer.Option("--issue", help="Filter to one issue reference.")
+    ] = None,
+    event: Annotated[str | None, typer.Option("--event", help="Filter to one event name.")] = None,
+    limit: Annotated[int, typer.Option("--limit")] = 20,
+    verify: Annotated[
+        bool, typer.Option("--verify", help="Prove the append-only triggers are active.")
+    ] = False,
+) -> None:
+    """Show the append-only audit log, newest first."""
+    conn = open_db(db_path)
+    try:
+        if verify:
+            ok, why = audit.verify_append_only(conn)
+            if ok:
+                console.print("append-only: verified (UPDATE and DELETE both refused)")
+            else:
+                console.print(f"[red]append-only: FAILED[/red] {why}")
+                raise typer.Exit(code=1)
+
+        repo_full_name = None
+        issue_number = None
+        if issue is not None:
+            repo_full_name, issue_number = parse_issue_reference(issue)
+
+        events = audit.list_events(
+            conn,
+            repo_full_name=repo_full_name,
+            issue_number=issue_number,
+            event=event,
+            limit=limit,
+        )
+        if not events:
+            console.print("no audit events")
+            return
+
+        table = Table(title=f"audit log ({audit.count_events(conn)} total)")
+        table.add_column("when")
+        table.add_column("event")
+        table.add_column("issue")
+        table.add_column("severity")
+        table.add_column("detail")
+        for item in events:
+            ref = (
+                f"{item.repo_full_name}#{item.issue_number}"
+                if item.repo_full_name and item.issue_number
+                else "-"
+            )
+            table.add_row(
+                item.created_at.strftime("%Y-%m-%d %H:%M:%S") if item.created_at else "-",
+                item.event,
+                ref,
+                item.severity,
+                item.detail[:60],
+            )
+        console.print(table)
+    finally:
+        conn.close()
+
+
+@app.command()
+def track(
+    issue: Annotated[str, typer.Argument(help="Issue reference, e.g. owner/repo#123.")],
+    db_path: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
+    pr_number: Annotated[
+        int | None, typer.Option("--pr", help="PR number. Defaults to the recorded publication.")
+    ] = None,
+) -> None:
+    """Fetch a published PR's real state and record it (SPEC section 2J).
+
+    Read-only: this uses GITHUB_TOKEN and never the publishing credential. It
+    fetches the PR status, reviews, and review comments, counts recorded
+    validation failures, and stores the result.
+    """
+    repo_full_name, number = parse_issue_reference(issue)
+    conn = open_db(db_path)
+    try:
+        resolved_pr = pr_number
+        if resolved_pr is None:
+            publications = storage.list_publications(conn, repo_full_name, number)
+            published = [p for p in publications if p.published and p.pr_number]
+            if not published:
+                console.print(
+                    f"[yellow]no published PR recorded for {repo_full_name}#{number}[/yellow]"
+                )
+                raise typer.Exit(code=1)
+            resolved_pr = published[-1].pr_number
+
+        try:
+            client = build_client()
+        except ForgeFlowError as exc:
+            console.print(f"[red]error:[/red] {exc}")
+            raise typer.Exit(code=1) from exc
+
+        try:
+            outcome = outcome_tracker.track_pull_request(
+                conn, client, repo_full_name, number, int(resolved_pr)
+            )
+        except (GitHubError, ForgeFlowError) as exc:
+            console.print(f"[red]error:[/red] {exc}")
+            raise typer.Exit(code=1) from exc
+        finally:
+            client.close()
+
+        console.print(f"{repo_full_name}#{number} PR #{outcome.pr_number}: {outcome.status.value}")
+        console.print(f"  url:              {outcome.pr_url}")
+        console.print(f"  draft:            {outcome.draft}")
+        console.print(f"  review decision:  {outcome.review_decision.value}")
+        console.print(f"  review comments:  {outcome.review_comments}")
+        console.print(f"  requested changes: {outcome.requested_changes}")
+        console.print(f"  approvals:        {outcome.approvals}")
+        console.print(f"  recorded failures: {outcome.failures}")
+        console.print(f"  recorded cost:    ${outcome.cost_usd:.6f}")
+    finally:
+        conn.close()
+
+
+@app.command()
+def metrics(
+    db_path: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
+) -> None:
+    """Show the SPEC section 11 evaluation metrics across tracked tasks."""
+    conn = open_db(db_path)
+    try:
+        report = outcome_tracker.metrics_report(conn)
+    finally:
+        conn.close()
+
+    table = Table(title="outcome metrics (SPEC section 11)")
+    table.add_column("metric")
+    table.add_column("value", justify="right")
+    for name in outcome_tracker.SPEC_METRICS:
+        table.add_row(name, f"{report.get(name, 0)}")
+    console.print(table)
+    console.print(
+        "[dim]time_saved_hours is reported as 0.0: it is not measured, and a "
+        "constant estimate would be a fabricated benchmark.[/dim]"
+    )
+
+
+def _approval_common(
+    issue: str,
+    db_path: Path,
+    config_path: Path,
+    target_branch: str,
+    actor: str,
+    reason: str,
+    action: ApprovalAction,
+) -> None:
+    """Shared body for the four approval commands.
+
+    Kept in one place so the four actions cannot drift apart in how they check
+    the kill switch or report a failure.
+    """
+    repo_full_name, number = parse_issue_reference(issue)
+    try:
+        config = load_app_config(config_path)
+        conn = open_db(db_path)
+        require_kill_switch_clear(config, None, conn)
+    except KillSwitchEngagedError as exc:
+        console.print(f"[red]kill switch:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    except ForgeFlowError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    try:
+        decision, state = approval.apply_action(
+            conn,
+            repo_full_name,
+            number,
+            action,
+            actor=actor,
+            reason=reason,
+            target_branch=target_branch,
+        )
+    except (ApprovalError, IllegalTransitionError) as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    finally:
+        conn.close()
+
+    console.print(f"{action.value}: {repo_full_name}#{number}")
+    console.print(f"  patch sha256: {decision.patch_sha256}")
+    console.print(f"  actor:        {decision.actor}")
+    console.print(f"  state:        {state.value}")
+    if action is ApprovalAction.APPROVE:
+        console.print(
+            "[yellow]note:[/yellow] this approval is bound to that exact patch hash. "
+            "If the patch changes, approval must be given again."
+        )
+
+
+@app.command()
+def approve(
+    issue: Annotated[str, typer.Argument(help="Issue reference, e.g. owner/repo#123.")],
+    db_path: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
+    config_path: Annotated[Path, typer.Option("--config")] = DEFAULT_CONFIG_PATH,
+    target_branch: Annotated[
+        str, typer.Option("--target-branch", help="Branch the patch is approved for.")
+    ] = "",
+    actor: Annotated[str, typer.Option("--actor", help="Who is approving.")] = "operator",
+    reason: Annotated[str, typer.Option("--reason")] = "",
+) -> None:
+    """Approve the latest patch for publishing, bound to its exact hash.
+
+    This records consent only. Nothing is published: publishing is Phase 4.
+    """
+    _approval_common(
+        issue, db_path, config_path, target_branch, actor, reason, ApprovalAction.APPROVE
+    )
+
+
+@app.command("request-changes")
+def request_changes(
+    issue: Annotated[str, typer.Argument(help="Issue reference, e.g. owner/repo#123.")],
+    db_path: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
+    config_path: Annotated[Path, typer.Option("--config")] = DEFAULT_CONFIG_PATH,
+    target_branch: Annotated[str, typer.Option("--target-branch")] = "",
+    actor: Annotated[str, typer.Option("--actor")] = "operator",
+    reason: Annotated[str, typer.Option("--reason", help="What must change.")] = "",
+) -> None:
+    """Send the task back to implementing for another attempt."""
+    _approval_common(
+        issue, db_path, config_path, target_branch, actor, reason, ApprovalAction.REQUEST_CHANGES
+    )
+
+
+@app.command()
+def reject(
+    issue: Annotated[str, typer.Argument(help="Issue reference, e.g. owner/repo#123.")],
+    db_path: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
+    config_path: Annotated[Path, typer.Option("--config")] = DEFAULT_CONFIG_PATH,
+    target_branch: Annotated[str, typer.Option("--target-branch")] = "",
+    actor: Annotated[str, typer.Option("--actor")] = "operator",
+    reason: Annotated[str, typer.Option("--reason")] = "",
+) -> None:
+    """Reject the patch. The task is discarded."""
+    _approval_common(
+        issue, db_path, config_path, target_branch, actor, reason, ApprovalAction.REJECT
+    )
+
+
+@app.command()
+def discard(
+    issue: Annotated[str, typer.Argument(help="Issue reference, e.g. owner/repo#123.")],
+    db_path: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
+    config_path: Annotated[Path, typer.Option("--config")] = DEFAULT_CONFIG_PATH,
+    target_branch: Annotated[str, typer.Option("--target-branch")] = "",
+    actor: Annotated[str, typer.Option("--actor")] = "operator",
+    reason: Annotated[str, typer.Option("--reason")] = "",
+) -> None:
+    """Abandon the task without judging the patch."""
+    _approval_common(
+        issue, db_path, config_path, target_branch, actor, reason, ApprovalAction.DISCARD
+    )
+
+
+@app.command()
+def validate(
+    issue: Annotated[str, typer.Argument(help="Issue reference, e.g. owner/repo#123.")],
+    db_path: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
+    config_path: Annotated[Path, typer.Option("--config")] = DEFAULT_CONFIG_PATH,
+    workspace_root: Annotated[Path, typer.Option("--workspace-root")] = Path("data/workspaces"),
+    timeout: Annotated[
+        float, typer.Option("--timeout", help="Per-check wall-clock limit in seconds.")
+    ] = 900.0,
+    repair_attempts: Annotated[
+        int, typer.Option("--repair-attempts", help="Repairs already made (SPEC 7 caps this at 2).")
+    ] = 0,
+) -> None:
+    """Run the target repository's tests and lint checks against the latest patch.
+
+    Every command runs in the sandbox. With no container isolation the checks are
+    recorded as skipped with the reason, and the task fails validation rather than
+    advancing on unproven code.
+    """
+    repo_full_name, number = parse_issue_reference(issue)
+    try:
+        config = load_app_config(config_path)
+        conn = open_db(db_path)
+        require_kill_switch_clear(config, None, conn)
+    except KillSwitchEngagedError as exc:
+        console.print(f"[red]kill switch:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    except ForgeFlowError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    try:
+        validator = build_validator(
+            sandbox=build_sandbox(app_config=config),
+            timeout=timeout,
+            app_config=config,
+        )
+        outcome = run_validation(
+            conn,
+            repo_full_name,
+            number,
+            validator=validator,
+            workspace_root=workspace_root,
+            repair_attempts=repair_attempts,
+        )
+    except PipelineError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    except IsolationError as exc:
+        console.print(f"[red]isolation:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    finally:
+        conn.close()
+
+    report = outcome.report
+    table = Table(title=f"validation: {repo_full_name}#{number}")
+    table.add_column("check")
+    table.add_column("status")
+    table.add_column("exit")
+    table.add_column("detail")
+    for check in report.checks:
+        detail = check.skip_reason or check.limitation or ""
+        table.add_row(
+            check.name,
+            check.status.value,
+            str(check.exit_code) if check.exit_code is not None else "-",
+            detail[:50],
+        )
+    console.print(table)
+
+    if report.findings:
+        console.print(f"[yellow]{len(report.findings)} diff finding(s):[/yellow]")
+        for finding in report.findings:
+            console.print(f"  [{finding.severity}] {finding.category}: {finding.detail}")
+
+    for limitation in report.environment_limitations:
+        console.print(f"[yellow]limitation:[/yellow] {limitation}")
+
+    if outcome.passed:
+        console.print(f"[green]validation passed[/green] - state: {outcome.issue.task_state.value}")
+        return
+
+    console.print(
+        f"[red]validation FAILED[/red] - state: {outcome.issue.task_state.value}. "
+        "Publishing is blocked."
+    )
+    raise typer.Exit(code=1)
+
+
+@app.command("validation-exception")
+def validation_exception(
+    issue: Annotated[str, typer.Argument(help="Issue reference, e.g. owner/repo#123.")],
+    db_path: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
+    config_path: Annotated[Path, typer.Option("--config")] = DEFAULT_CONFIG_PATH,
+    actor: Annotated[
+        str, typer.Option("--actor", help="Who authorizes the exception.")
+    ] = "operator",
+    reason: Annotated[str, typer.Option("--reason", help="Why the failure is acceptable.")] = "",
+) -> None:
+    """Record a documented exception that authorizes publishing past a failure.
+
+    SPEC section 7 allows a failed check to be overridden only by an explicit,
+    documented review. The exception is bound to the exact patch hash, so a new
+    patch needs a new exception. It writes an audit event, because the whole
+    point is that the override is recorded rather than silent.
+    """
+    if not reason.strip():
+        console.print("[red]error:[/red] --reason is required; an exception must be documented")
+        raise typer.Exit(code=1)
+
+    repo_full_name, number = parse_issue_reference(issue)
+    try:
+        config = load_app_config(config_path)
+        conn = open_db(db_path)
+        require_kill_switch_clear(config, None, conn)
+    except KillSwitchEngagedError as exc:
+        console.print(f"[red]kill switch:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    except ForgeFlowError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    try:
+        patch = storage.latest_patch(conn, repo_full_name, number)
+        if patch is None:
+            console.print(
+                f"[red]error:[/red] no patch recorded for {repo_full_name}#{number}; "
+                "run 'forgeflow implement' first"
+            )
+            raise typer.Exit(code=1)
+
+        storage.record_validation_exception(
+            conn,
+            repo_full_name,
+            number,
+            patch_sha256=patch.patch_sha256,
+            authorized_by=actor,
+            reason=reason,
+        )
+        audit.record(
+            conn,
+            "validation.exception_recorded",
+            repo_full_name=repo_full_name,
+            issue_number=number,
+            severity="warning",
+            actor=actor,
+            detail=reason,
+            payload={"patch_sha256": patch.patch_sha256},
+        )
+    finally:
+        conn.close()
+
+    console.print(f"validation-exception: {repo_full_name}#{number}")
+    console.print(f"  patch sha256: {patch.patch_sha256}")
+    console.print(f"  authorized:   {actor}")
+    console.print(f"  reason:       {reason}")
+    console.print("note: this exception is bound to that exact patch hash.")
+
+
+def build_write_client() -> GitHubWriteClient:
+    """Construct the publishing client. The token is read inside the client.
+
+    This function never reads the token itself, so the CLI process can report a
+    missing credential without holding one.
+    """
+    return GitHubWriteClient()
+
+
+@app.command()
+def publish(
+    issue: Annotated[str, typer.Argument(help="Issue reference, e.g. owner/repo#123.")],
+    db_path: Annotated[Path, typer.Option("--db")] = DEFAULT_DB_PATH,
+    config_path: Annotated[Path, typer.Option("--config")] = DEFAULT_CONFIG_PATH,
+    target_branch: Annotated[
+        str, typer.Option("--target-branch", help="Branch the draft PR would target.")
+    ] = "main",
+    confirm_real_publish: Annotated[
+        bool,
+        typer.Option(
+            "--confirm-real-publish",
+            help="Actually create the draft PR. Without this flag the run is a dry run.",
+        ),
+    ] = False,
+    actor: Annotated[str, typer.Option("--actor")] = "operator",
+) -> None:
+    """Publish the approved patch as a DRAFT PR, or show what would be written.
+
+    Dry-run is the default: without --confirm-real-publish nothing is sent to
+    GitHub. A real write needs a valid approval for this exact patch, a task at
+    awaiting_publish_approval, and a repository on the allowlist.
+    """
+    repo_full_name, number = parse_issue_reference(issue)
+    try:
+        config = load_app_config(config_path)
+        conn = open_db(db_path)
+        require_kill_switch_clear(config, None, conn)
+    except KillSwitchEngagedError as exc:
+        console.print(f"[red]kill switch:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    except ForgeFlowError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    mode = PublishMode.REAL if confirm_real_publish else PublishMode.DRY_RUN
+    client = None
+    read_client = None
+    try:
+        if mode is PublishMode.REAL:
+            client = build_write_client()
+            # The issue reference is verified with the read-only credential, not
+            # the publishing token. The publishing token is narrow by design and
+            # must not be assumed to have read access to the issues API.
+            read_client = build_client()
+        plan = plan_publish(
+            conn,
+            repo_full_name,
+            number,
+            target_branch=target_branch,
+            mode=mode,
+            client=client,
+            read_client=read_client,
+            actor=actor,
+        )
+    except (PublisherError, ForgeFlowError) as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        if read_client is not None:
+            read_client.close()
+        if client is not None:
+            client.close()
+        conn.close()
+        raise typer.Exit(code=1) from exc
+
+    console.print(plan.render())
+
+    if plan.refused:
+        console.print(f"\n[red]refused:[/red] {plan.refusal_reason}")
+        raise typer.Exit(code=1)
+
+    if mode is PublishMode.DRY_RUN:
+        console.print(
+            "\n[yellow]dry run:[/yellow] nothing was written. Re-run with "
+            "--confirm-real-publish to open the draft PR."
+        )
+        try:
+            publish_patch(
+                conn,
+                repo_full_name,
+                number,
+                target_branch=target_branch,
+                mode=PublishMode.DRY_RUN,
+                actor=actor,
+            )
+        except PublisherError as exc:
+            console.print(f"[red]error:[/red] {exc}")
+            raise typer.Exit(code=1) from exc
+        finally:
+            conn.close()
+        return
+
+    try:
+        record = publish_patch(
+            conn,
+            repo_full_name,
+            number,
+            target_branch=target_branch,
+            mode=PublishMode.REAL,
+            client=client,
+            read_client=read_client,
+            actor=actor,
+        )
+    except PublisherError as exc:
+        console.print(f"[red]error:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+    finally:
+        conn.close()
+        if read_client is not None:
+            read_client.close()
+        if client is not None:
+            client.close()
+
+    console.print(f"[green]draft PR created:[/green] {record.pr_url}")
 
 
 if __name__ == "__main__":

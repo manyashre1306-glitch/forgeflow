@@ -22,8 +22,10 @@ from forgeflow.models import (
     IssueScore,
     LLMUsage,
     PatchRecord,
+    PublicationRecord,
     Repository,
     TaskState,
+    ValidationReport,
     validate_transition,
 )
 
@@ -119,6 +121,67 @@ CREATE TABLE IF NOT EXISTS analyses (
         REFERENCES issues(repo_full_name, number)
 );
 
+CREATE TABLE IF NOT EXISTS publications (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at      TEXT NOT NULL,
+    repo_full_name  TEXT NOT NULL,
+    issue_number    INTEGER NOT NULL,
+    patch_sha256    TEXT NOT NULL,
+    target_branch   TEXT NOT NULL DEFAULT '',
+    head_branch     TEXT NOT NULL DEFAULT '',
+    mode            TEXT NOT NULL,
+    published       INTEGER NOT NULL DEFAULT 0,
+    draft           INTEGER NOT NULL DEFAULT 1,
+    pr_number       INTEGER,
+    pr_url          TEXT NOT NULL DEFAULT '',
+    title           TEXT NOT NULL DEFAULT '',
+    body            TEXT NOT NULL DEFAULT '',
+    refusal_reason  TEXT NOT NULL DEFAULT '',
+    actor           TEXT NOT NULL DEFAULT 'operator',
+    FOREIGN KEY (repo_full_name, issue_number)
+        REFERENCES issues(repo_full_name, number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_publications_patch
+    ON publications (repo_full_name, issue_number, patch_sha256);
+
+CREATE TABLE IF NOT EXISTS validation_results (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at      TEXT NOT NULL,
+    repo_full_name  TEXT NOT NULL,
+    issue_number    INTEGER NOT NULL,
+    patch_sha256    TEXT NOT NULL,
+    kind            TEXT NOT NULL,
+    name            TEXT NOT NULL,
+    command_json    TEXT NOT NULL DEFAULT '[]',
+    status          TEXT NOT NULL,
+    exit_code       INTEGER,
+    output          TEXT NOT NULL DEFAULT '',
+    duration_seconds REAL NOT NULL DEFAULT 0.0,
+    skip_reason     TEXT,
+    limitation      TEXT,
+    timed_out       INTEGER NOT NULL DEFAULT 0,
+    isolated        INTEGER NOT NULL DEFAULT 0,
+    repair_attempts INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (repo_full_name, issue_number)
+        REFERENCES issues(repo_full_name, number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_validation_results_patch
+    ON validation_results (repo_full_name, issue_number, patch_sha256);
+
+CREATE TABLE IF NOT EXISTS validation_exceptions (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    created_at     TEXT NOT NULL,
+    repo_full_name TEXT NOT NULL,
+    issue_number   INTEGER NOT NULL,
+    patch_sha256   TEXT NOT NULL,
+    authorized_by  TEXT NOT NULL,
+    reason         TEXT NOT NULL,
+    FOREIGN KEY (repo_full_name, issue_number)
+        REFERENCES issues(repo_full_name, number)
+);
+
 CREATE TABLE IF NOT EXISTS llm_usage (
     id                INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at        TEXT NOT NULL,
@@ -170,6 +233,14 @@ def init_db(conn: sqlite3.Connection) -> None:
     """Create the schema. Safe to call repeatedly."""
     conn.executescript(SCHEMA)
     conn.commit()
+    # Phase 3 tables live in their own modules so each owns its schema.
+    from forgeflow import approval, audit, killswitch, outcome_tracker, scheduler
+
+    audit.ensure_schema(conn)
+    killswitch.ensure_schema(conn)
+    approval.ensure_schema(conn)
+    outcome_tracker.ensure_schema(conn)
+    scheduler.ensure_schema(conn)
 
 
 def upsert_repository(conn: sqlite3.Connection, repo: Repository) -> None:
@@ -714,6 +785,273 @@ def record_analysis(conn: sqlite3.Connection, record: AnalysisRecord) -> int:
     )
     conn.commit()
     return int(cursor.lastrowid or 0)
+
+
+def record_publication(conn: sqlite3.Connection, record: PublicationRecord) -> int:
+    """Insert one publish attempt and return its row id.
+
+    Dry runs are recorded as well as real publishes, so the log shows what was
+    proposed even when nothing was written.
+    """
+    from forgeflow.security import redact
+
+    cursor = conn.execute(
+        """
+        INSERT INTO publications (
+            created_at, repo_full_name, issue_number, patch_sha256, target_branch,
+            head_branch, mode, published, draft, pr_number, pr_url, title, body,
+            refusal_reason, actor
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            (record.created_at or datetime.now(UTC)).isoformat(),
+            record.repo_full_name,
+            record.issue_number,
+            record.patch_sha256,
+            record.target_branch,
+            record.head_branch,
+            record.mode.value,
+            1 if record.published else 0,
+            1 if record.draft else 0,
+            record.pr_number,
+            record.pr_url,
+            redact(record.title),
+            redact(record.body),
+            redact(record.refusal_reason),
+            record.actor,
+        ),
+    )
+    conn.commit()
+    return int(cursor.lastrowid or 0)
+
+
+def find_publication_for_patch(
+    conn: sqlite3.Connection,
+    repo_full_name: str,
+    issue_number: int,
+    patch_sha256: str,
+) -> PublicationRecord | None:
+    """Return a successful real publication of this exact patch, or None.
+
+    This is the idempotence query: a patch that already has a published PR must
+    not produce a second one. Dry runs are excluded, because a dry run created
+    nothing to duplicate.
+    """
+    row = conn.execute(
+        """
+        SELECT * FROM publications
+        WHERE repo_full_name = ? AND issue_number = ? AND patch_sha256 = ?
+          AND published = 1 AND pr_url != ''
+        ORDER BY id DESC LIMIT 1
+        """,
+        (repo_full_name, issue_number, patch_sha256),
+    ).fetchone()
+    if row is None:
+        return None
+    return _row_to_publication(row)
+
+
+def list_publications(
+    conn: sqlite3.Connection,
+    repo_full_name: str,
+    issue_number: int,
+) -> list[PublicationRecord]:
+    """Every publish attempt for a task, oldest first."""
+    rows = conn.execute(
+        """
+        SELECT * FROM publications
+        WHERE repo_full_name = ? AND issue_number = ?
+        ORDER BY id
+        """,
+        (repo_full_name, issue_number),
+    ).fetchall()
+    return [_row_to_publication(row) for row in rows]
+
+
+def _row_to_publication(row: sqlite3.Row) -> PublicationRecord:
+    return PublicationRecord(
+        id=row["id"],
+        created_at=datetime.fromisoformat(row["created_at"]),
+        repo_full_name=row["repo_full_name"],
+        issue_number=row["issue_number"],
+        patch_sha256=row["patch_sha256"],
+        target_branch=row["target_branch"],
+        head_branch=row["head_branch"],
+        mode=row["mode"],
+        published=bool(row["published"]),
+        draft=bool(row["draft"]),
+        pr_number=row["pr_number"],
+        pr_url=row["pr_url"],
+        title=row["title"],
+        body=row["body"],
+        refusal_reason=row["refusal_reason"],
+        actor=row["actor"],
+    )
+
+
+def record_validation_report(
+    conn: sqlite3.Connection,
+    report: ValidationReport,
+) -> int:
+    """Persist one validation report, one row per check. Returns rows written.
+
+    The check output is redacted before storage: a failing test can print a
+    credential, and this table is read back and shown to an operator.
+    """
+    from forgeflow.security import redact_all
+
+    created = (report.created_at or datetime.now(UTC)).isoformat()
+    rows = 0
+    for check in report.checks:
+        conn.execute(
+            """
+            INSERT INTO validation_results (
+                created_at, repo_full_name, issue_number, patch_sha256,
+                kind, name, command_json, status, exit_code, output,
+                duration_seconds, skip_reason, limitation, timed_out,
+                isolated, repair_attempts
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                created,
+                report.repo_full_name,
+                report.issue_number,
+                report.patch_sha256,
+                check.kind.value,
+                check.name,
+                json.dumps(check.command),
+                check.status.value,
+                check.exit_code,
+                redact_all(check.output),
+                check.duration_seconds,
+                check.skip_reason,
+                check.limitation,
+                1 if check.timed_out else 0,
+                1 if report.isolated else 0,
+                report.repair_attempts,
+            ),
+        )
+        rows += 1
+    conn.commit()
+    return rows
+
+
+def list_validation_results(
+    conn: sqlite3.Connection,
+    repo_full_name: str,
+    issue_number: int,
+    *,
+    patch_sha256: str | None = None,
+) -> list[dict[str, object]]:
+    """Read stored validation rows, oldest first, newest patch last."""
+    clauses = ["repo_full_name = ?", "issue_number = ?"]
+    params: list[object] = [repo_full_name, issue_number]
+    if patch_sha256 is not None:
+        clauses.append("patch_sha256 = ?")
+        params.append(patch_sha256)
+
+    rows = conn.execute(
+        f"""
+        SELECT * FROM validation_results
+        WHERE {" AND ".join(clauses)}
+        ORDER BY id
+        """,
+        params,
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def validation_passed_for_patch(
+    conn: sqlite3.Connection,
+    repo_full_name: str,
+    issue_number: int,
+    patch_sha256: str,
+) -> bool:
+    """Whether at least one check ran and passed for this exact patch.
+
+    This is the enforcement query. It requires a row whose status is 'passed',
+    which by construction only happens when a command actually executed and
+    exited zero. A patch with no rows, or only skipped rows, returns False.
+    """
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS n FROM validation_results
+        WHERE repo_full_name = ? AND issue_number = ?
+          AND patch_sha256 = ? AND status = 'passed'
+        """,
+        (repo_full_name, issue_number, patch_sha256),
+    ).fetchone()
+    return bool(row and row["n"] > 0)
+
+
+def validation_failed_for_patch(
+    conn: sqlite3.Connection,
+    repo_full_name: str,
+    issue_number: int,
+    patch_sha256: str,
+) -> bool:
+    """Whether any recorded check failed or errored for this exact patch."""
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS n FROM validation_results
+        WHERE repo_full_name = ? AND issue_number = ?
+          AND patch_sha256 = ? AND status IN ('failed', 'errored')
+        """,
+        (repo_full_name, issue_number, patch_sha256),
+    ).fetchone()
+    return bool(row and row["n"] > 0)
+
+
+def record_validation_exception(
+    conn: sqlite3.Connection,
+    repo_full_name: str,
+    issue_number: int,
+    *,
+    patch_sha256: str,
+    authorized_by: str,
+    reason: str,
+) -> int:
+    """Record a documented exception that authorizes publishing past a failure."""
+    cursor = conn.execute(
+        """
+        INSERT INTO validation_exceptions (
+            created_at, repo_full_name, issue_number, patch_sha256,
+            authorized_by, reason
+        ) VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            datetime.now(UTC).isoformat(),
+            repo_full_name,
+            issue_number,
+            patch_sha256,
+            authorized_by,
+            reason,
+        ),
+    )
+    conn.commit()
+    return int(cursor.lastrowid or 0)
+
+
+def validation_exception_for_patch(
+    conn: sqlite3.Connection,
+    repo_full_name: str,
+    issue_number: int,
+    patch_sha256: str,
+) -> dict[str, object] | None:
+    """Return the recorded exception for this exact patch, or None.
+
+    Bound to the patch hash, so an exception cannot be reused for a different
+    patch filed under the same issue.
+    """
+    row = conn.execute(
+        """
+        SELECT * FROM validation_exceptions
+        WHERE repo_full_name = ? AND issue_number = ? AND patch_sha256 = ?
+        ORDER BY id DESC LIMIT 1
+        """,
+        (repo_full_name, issue_number, patch_sha256),
+    ).fetchone()
+    return dict(row) if row else None
 
 
 def _row_to_analysis(row: sqlite3.Row) -> AnalysisRecord:

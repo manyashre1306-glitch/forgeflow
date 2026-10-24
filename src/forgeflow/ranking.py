@@ -24,7 +24,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from forgeflow.config import AppConfig
+from forgeflow.config import AppConfig, OutcomeRankingConfig
 from forgeflow.models import (
     DEFAULT_WEIGHTS,
     SCORE_FACTORS,
@@ -399,42 +399,128 @@ def total_for(score: IssueScore, weights: Mapping[str, float]) -> float:
     return score.compute_total(dict(weights))
 
 
+# --------------------------------------------------------------------------
+# Outcome-driven ranking adjustment (SPEC section 11)
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RepoOutcomeStats:
+    """Aggregate tracked PR outcomes for one repository.
+
+    Built from the ``pull_request_outcomes`` table, never guessed. Counts are
+    engagement events, not a merge rate: an approval, a merge, and a
+    changes-requested are each a signal that the task was real and worth doing.
+    """
+
+    merged: int = 0
+    approvals: int = 0
+    changes_requested: int = 0
+    closed_unmerged: int = 0
+    total: int = 0
+
+    def as_reason(self) -> str:
+        """A short, factual summary for a ranking explanation."""
+        return (
+            f"{self.total} tracked PR(s): {self.merged} merged, "
+            f"{self.approvals} approved, {self.changes_requested} changes requested, "
+            f"{self.closed_unmerged} closed unmerged"
+        )
+
+
+def outcome_adjustment(
+    config: AppConfig | None,
+    stats: RepoOutcomeStats | None,
+) -> float:
+    """A small, capped points adjustment from tracked PR outcomes.
+
+    Returns 0.0 when the adjustment is disabled (the default), when there are no
+    outcomes, or when the repository is unknown. The result is clamped to
+    ``[-max_adjustment_points, +max_adjustment_points]``, so history can nudge a
+    ranking but never dominate the six SPEC section 5 factors.
+
+    Merges weigh most, but approvals and changes-requested also count: SPEC
+    section 11 says not to optimize only for contribution count or merge rate, so
+    a maintainer who engaged with the work is treated as a positive signal even
+    when the PR was not merged.
+    """
+    cfg = config.outcome_ranking if config is not None else OutcomeRankingConfig()
+    if not cfg.enabled or stats is None or stats.total <= 0:
+        return 0.0
+    raw = (
+        stats.merged * cfg.points_per_merge
+        + stats.approvals * cfg.points_per_approval
+        + stats.changes_requested * cfg.points_per_changes_requested
+        + stats.closed_unmerged * cfg.points_per_closed_unmerged
+    )
+    capped = max(-cfg.max_adjustment_points, min(cfg.max_adjustment_points, raw))
+    return round(capped, 4)
+
+
+def adjusted_total(
+    score: IssueScore,
+    weights: Mapping[str, float],
+    adjustment: float,
+) -> float:
+    """The weighted total plus the outcome adjustment, floored at zero.
+
+    Zero is the floor because a negative total is not meaningful on the 0-100
+    scale and would sort an issue below one that simply has no history.
+    """
+    return round(max(0.0, total_for(score, weights) + adjustment), 4)
+
+
 def rank_issues(
     issues: Iterable[Issue],
     config: AppConfig | None = None,
     repositories: Mapping[str, Repository] | None = None,
     *,
     now: datetime | None = None,
+    outcomes: Mapping[str, RepoOutcomeStats] | None = None,
 ) -> list[RankedIssue]:
     """Score and rank issues, highest total first.
 
     Issues that are not open are never ranked. Ties are broken by repository
     name and then issue number, so the output is deterministic.
+
+    ``outcomes`` optionally maps a repository to its tracked PR history. When
+    supplied and the adjustment is enabled in config, each issue's total is
+    nudged by a small, capped amount before sorting. When omitted, ranking is
+    exactly as before.
     """
     repos = repositories or {}
+    outcome_map = outcomes or {}
     weights = resolve_weights(config)
-    scored: list[tuple[float, Issue, IssueScore]] = []
+    scored: list[tuple[float, float, Issue, IssueScore]] = []
 
     for issue in issues:
         if issue.state != "open":
             continue
         score = score_issue(issue, config, repos.get(issue.repo_full_name), now=now)
-        scored.append((total_for(score, weights), issue, score))
+        adjustment = outcome_adjustment(config, outcome_map.get(issue.repo_full_name))
+        scored.append((adjusted_total(score, weights, adjustment), adjustment, issue, score))
 
-    scored.sort(key=lambda item: (-item[0], item[1].repo_full_name, item[1].number))
+    scored.sort(key=lambda item: (-item[0], item[2].repo_full_name, item[2].number))
     return [
-        RankedIssue(issue=issue, score=score, rank=index)
-        for index, (_total, issue, score) in enumerate(scored, start=1)
+        RankedIssue(issue=issue, score=score, rank=index, outcome_adjustment=adjustment)
+        for index, (_total, adjustment, issue, score) in enumerate(scored, start=1)
     ]
 
 
 def explain(ranked: RankedIssue, weights: Mapping[str, float]) -> str:
     """Render one ranked issue as a multi-line explanation for reports."""
+    base = total_for(ranked.score, weights)
+    total = adjusted_total(ranked.score, weights, ranked.outcome_adjustment)
     lines = [
         f"#{ranked.rank} {ranked.issue.repo_full_name}#{ranked.issue.number} "
-        f"- total {total_for(ranked.score, weights):.2f}/100",
-        f"    {ranked.issue.title}",
+        f"- total {total:.2f}/100",
     ]
+    if ranked.outcome_adjustment:
+        lines.append(
+            f"    outcome adjustment {ranked.outcome_adjustment:+.2f} "
+            f"(base {base:.2f}, capped, from tracked PR history)"
+        )
+    lines.append(f"    {ranked.issue.title}")
     for factor in SCORE_FACTORS:
         value = getattr(ranked.score, factor)
         weight = weights.get(factor, 0.0)
