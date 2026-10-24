@@ -37,11 +37,15 @@ command you can re-run.
 | 2 | Repo context, agent adapter, analysis, sandbox, patch + review | Complete, with a documented limitation |
 | 3 | Validation, task states, security checks, approval-boundary tests | Complete |
 | 4 | Controlled publishing (draft PRs), feedback tracking, discovery-only scheduling | Complete, with a documented limitation |
-| 5 | Documentation, architecture, threat model, evaluation, demo, portfolio README | In progress |
+| 5 | Documentation, architecture, threat model, evaluation, demo, portfolio README | Complete, with documented limitations |
 
 Phase 5 adds documentation, the architecture diagram, the threat model, the
-evaluation harness and results, an offline dry-run demo, read-only CI, and this
-README. It adds **no new external write** and **no new credential**.
+evaluation harness and results, an offline dry-run demo, read-only CI, this
+README, and a requirement-by-requirement [SPEC audit](docs/spec-audit.md). It
+adds **no new external write** and **no new credential**. The audit lists every
+requirement that this environment could not exercise (real model calls, real
+validation, an automated integration test, a benchmark run); none of them is a
+missing feature, and none is claimed as done.
 
 ## Architecture
 
@@ -292,10 +296,9 @@ none of those have been measured or received.
 
 ## Roadmap
 
-Phase 5 (this phase) is in progress. Beyond it:
+Phases 1 through 5 are complete. What remains is blocked by the environment, not
+by missing code:
 
-- **Finish Phase 5.** Evaluation results, final demonstration write-up, and this
-  portfolio README are the remaining deliverables.
 - **Run a real coding agent end to end.** Requires a `JULES_API_KEY` (mintable
   only in the Jules web app) or another provider behind the existing
   `CodingAgent` adapter.
