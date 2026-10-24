@@ -60,10 +60,22 @@ cp .env.example .env
 # then edit .env and set GITHUB_TOKEN=...
 ```
 
-ForgeFlow only needs public read access. A classic token with no scopes, or a
-fine-grained token with public read-only access, is sufficient. **Phase 1 never
-writes to GitHub.** The token is read from the environment (or `.env`) and is
-never printed or logged.
+ForgeFlow only needs public read access for discovery, ranking, analysis, and
+outcome tracking. A classic token with no scopes, or a fine-grained token with
+public read-only access, is sufficient. **Publishing is the only write path** and
+uses a separate `FORGEFLOW_PUBLISH_TOKEN` (see "Publishing"). Tokens are read
+from the environment (or `.env`) and are never printed or logged.
+
+Common commands are wrapped in a Makefile (`make help` lists them):
+
+```bash
+make setup      # uv sync
+make check      # lint, format check, and the full test suite
+make test       # just the tests
+make eval       # the offline evaluation harness
+```
+
+See `docs/setup.md` for a full walkthrough and `Makefile` for every target.
 
 Edit `config/repositories.yaml` to change the repository allowlist, the ranking
 weights, and the skill keywords. Nothing outside the allowlist is ever queried.
